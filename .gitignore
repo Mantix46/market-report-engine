@@ -1,0 +1,51 @@
+# Sekrety i lokalna konfiguracja
+.env
+.env.*
+!.env.example
+!config.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+credentials*.json
+service-account*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+
+# Pliki generowane podczas działania
+logs.txt
+*.log
+raporty/
+preview_output.txt
+watchlists.json
+daily_snapshots.csv
+prediction_tracker.csv
+
+# Lokalne narzędzia i instrukcje agentów
+.agents/
+AGENTS.md
+.claude/
+CLAUDE.md
+.claudeignore
+.codex/
+.idea/
+.vscode/
+
+# System operacyjny
+.DS_Store
+Thumbs.db
+Desktop.ini

@@ -1,0 +1,83 @@
+name: Daily Market Report
+
+on:
+  # Uruchomienie kontrolowane przez cron-job.org (POST workflow_dispatch)
+  # lub ręcznie z poziomu strony GitHuba.
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    # Publiczne repo nie zapisuje własnego stanu. Zapis do prywatnego repo
+    # autoryzuje osobny, ograniczony STATE_REPO_TOKEN.
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout public application
+        uses: actions/checkout@v6
+        with:
+          path: app
+
+      - name: Checkout private state
+        uses: actions/checkout@v6
+        with:
+          repository: Mantix46/market-report-state
+          token: ${{ secrets.STATE_REPO_TOKEN }}
+          path: state
+
+      - name: Restore private configuration and state
+        run: |
+          set -euo pipefail
+          for file in watchlists.json daily_snapshots.csv prediction_tracker.csv; do
+            test -f "state/$file" || { echo "::error::Missing state/$file"; exit 1; }
+            cp "state/$file" "app/$file"
+          done
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: app/requirements.txt
+
+      - name: Install dependencies
+        working-directory: app
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Market Report Engine
+        working-directory: app
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: python main.py
+
+      - name: Copy updated state
+        if: success()
+        run: |
+          cp app/daily_snapshots.csv state/daily_snapshots.csv
+          cp app/prediction_tracker.csv state/prediction_tracker.csv
+
+      - name: Commit updated private state
+        if: success()
+        working-directory: state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add daily_snapshots.csv prediction_tracker.csv
+          if git diff --cached --quiet; then
+            echo "No state changes to commit."
+          else
+            git commit -m "data: update report state [skip ci]"
+            git push
+          fi

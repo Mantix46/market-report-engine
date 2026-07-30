@@ -1,0 +1,11 @@
+{
+  "US_TICKERS": ["AAPL", "MSFT"],
+  "GPW_TICKERS_MAP": {
+    "PKO.WA": "PKO BP"
+  },
+  "GPW_NEWS_QUERIES": {
+    "PKO.WA": "PKO BP akcje"
+  },
+  "TICKER_NOTES": {},
+  "RADAR_SMALLCAPS": ["SOFI", "PLTR", "IONQ"]
+}

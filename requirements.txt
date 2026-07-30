@@ -1,0 +1,10 @@
+requests>=2.31.0,<3
+python-dotenv>=1.0.0,<2
+schedule>=1.2.0,<2
+markdown>=3.5.0,<4
+google-genai>=2.4.0,<3
+yfinance>=0.2.36,<0.3
+pandas>=2.0.0,<3
+lxml>=4.9.0,<7
+html5lib>=1.1,<2
+holidays>=0.45,<1

@@ -15,6 +15,20 @@ Projekt służy do automatyzacji researchu rynkowego. Nie jest systemem transakc
 - archiwizacja raportów i wysyłka przez SMTP,
 - uruchamianie lokalne, w schedulerze albo przez GitHub Actions.
 
+## Architektura repozytoriów
+
+Kod aplikacji znajduje się w publicznym repozytorium `market-report-engine`.
+Prywatna konfiguracja i stan działania są przechowywane oddzielnie:
+
+- `watchlists.json` — prywatna lista obserwowanych instrumentów i notatki,
+- `daily_snapshots.csv` — historia dziennych danych,
+- `prediction_tracker.csv` — historia i ocena prognoz.
+
+GitHub Actions pobiera te pliki z prywatnego repozytorium
+`Mantix46/market-report-state` i po udanym raporcie zapisuje tam zaktualizowane
+pliki CSV. Dzięki temu publiczna historia Git nie zawiera prywatnej watchlisty
+ani danych powstających podczas działania aplikacji.
+
 ## Wymagania
 
 - Python 3.11,
@@ -117,16 +131,19 @@ W repozytorium przejdź do:
 
 `Settings` → `Secrets and variables` → `Actions` → `New repository secret`
 
-Dodaj:
+Sekrety wymagane do pełnego działania:
 
 - `STATE_REPO_TOKEN` — fine-grained PAT z dostępem `Contents: Read and write` wyłącznie do prywatnego repo `market-report-state`,
 - `GEMINI_API_KEY`,
-- `GEMINI_MODEL`,
 - `SMTP_SERVER`,
 - `SMTP_PORT`,
 - `SMTP_USER`,
-- `SMTP_PASSWORD`,
-- `RECIPIENT_EMAIL`,
+- `SMTP_PASSWORD`.
+
+Sekrety opcjonalne:
+
+- `RECIPIENT_EMAIL` — domyślnie aplikacja używa wartości `SMTP_USER`,
+- `GEMINI_MODEL` — domyślnie aplikacja używa modelu skonfigurowanego w kodzie,
 - `FRED_API_KEY` — opcjonalnie,
 - `FMP_API_KEY` — opcjonalnie.
 
@@ -143,6 +160,32 @@ prediction_tracker.csv
 ```
 
 Jeżeli token wygaśnie albo któregoś pliku zabraknie, workflow zatrzyma się przed wygenerowaniem i wysłaniem raportu.
+
+Automatyczne uruchomienie może być zlecane przez cron-job.org przez endpoint
+GitHub `workflow_dispatch`. Token używany przez cron powinien mieć dostęp tylko
+do tego repozytorium i uprawnienie `Actions: Read and write`. Nie należy używać
+do tego celu `STATE_REPO_TOKEN`, ponieważ służy on wyłącznie do dostępu do
+prywatnego repozytorium stanu.
+
+## Wprowadzanie zmian
+
+Zmiany rozwijane są na branchu `feature-market-report-enhancements`:
+
+```powershell
+git switch feature-market-report-enhancements
+git pull
+```
+
+Przed wysłaniem zmian uruchom testy oraz bezpieczny podgląd raportu:
+
+```powershell
+python -m pytest
+python main.py --preview
+```
+
+Następnie wykonaj commit i push na branch roboczy, utwórz pull request do
+`main` i zmerguj go dopiero po sprawdzeniu zmian. Codzienny raport korzysta z
+`main`, więc sam push na branch roboczy nie zmienia wersji produkcyjnej.
 
 ## Struktura projektu
 
@@ -164,21 +207,22 @@ watchlists.example.json publiczny szablon obserwowanych instrumentów
 ## Testy
 
 ```powershell
-pytest
+python -m pytest
 ```
 
 Testy korzystają z mocków i nie powinny wysyłać e-maili.
 
 ## Dane i bezpieczeństwo
 
-Przed ustawieniem repozytorium jako publiczne sprawdź:
+Repozytorium kodu jest publiczne. Przed każdym commitem sprawdź:
 
 - czy `.env`, logi i wygenerowane raporty nie są śledzone przez Git,
-- czy historia Git nigdy nie zawierała prawdziwych kluczy lub haseł,
 - czy `watchlists.json`, `daily_snapshots.csv` i `prediction_tracker.csv` znajdują się wyłącznie w prywatnym repo stanu,
 - czy GitHub Actions używa wyłącznie wartości zapisanych jako repository secrets.
 
-Samo dodanie pliku do `.gitignore` nie usuwa go z wcześniejszych commitów. Jeżeli sekret trafił do historii, najpierw unieważnij klucz lub hasło, a dopiero potem oczyść historię repozytorium.
+Samo dodanie pliku do `.gitignore` nie usuwa go z wcześniejszych commitów.
+Jeżeli sekret trafi do historii, najpierw unieważnij klucz lub hasło, a dopiero
+potem oczyść historię repozytorium.
 
 ## Ograniczenia
 
@@ -189,4 +233,7 @@ Samo dodanie pliku do `.gitignore` nie usuwa go z wcześniejszych commitów. Je�
 
 ## Licencja
 
-Repozytorium nie ma jeszcze pliku licencji. Publiczny kod bez licencji można przeglądać, ale inni nie otrzymują automatycznie prawa do jego kopiowania, modyfikowania i dystrybucji. Przed publikacją wybierz licencję świadomie, np. MIT dla prostego projektu open source.
+Projekt jest udostępniany na licencji MIT. Można go używać, kopiować,
+modyfikować i rozpowszechniać, również komercyjnie, pod warunkiem zachowania
+informacji o prawach autorskich i treści licencji. Szczegóły znajdują się w
+pliku [LICENSE](LICENSE).

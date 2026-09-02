@@ -6,7 +6,7 @@ from typing import Optional
 
 import yfinance as yf
 
-from data_fetching import clean_history, US_TICKERS, GPW_TICKERS_MAP
+from data_fetching import clean_history
 from market_calendar import warsaw_now, warsaw_today
 
 import logging
@@ -22,7 +22,8 @@ DIRECTION_NEUTRAL = "neutral"
 # Stare pliki bez tych kolumn wczytują się poprawnie (DictReader -> None).
 PREDICTION_FIELDNAMES = [
     "date", "ticker", "direction", "horizon_days", "base_price", "thesis", "source",
-    "atr_pct", "evaluated_date", "realized_pct", "hit",
+    "atr_pct", "confidence", "forecast_context", "evaluated_date", "realized_pct", "hit",
+    "reviewed_date", "outcome_explanation", "week_driver", "lesson",
 ]
 
 # Ile dni trzymamy historię prognoz w pliku
@@ -215,6 +216,12 @@ def extract_predictions_from_report(report: str, portfolio_tickers: list[str], c
             "neutralny": DIRECTION_NEUTRAL,
         }.get(raw_direction, raw_direction)
         ticker = match.group("ticker")
+        confidence_match = re.search(
+            r"(?:pewność|pewnosc|confidence)\s*[:=]\s*(niska|średnia|srednia|wysoka|low|medium|high)",
+            line,
+            re.IGNORECASE,
+        )
+        confidence = confidence_match.group(1).lower() if confidence_match else ""
         predictions.append({
             "date": today,
             "ticker": ticker,
@@ -223,9 +230,36 @@ def extract_predictions_from_report(report: str, portfolio_tickers: list[str], c
             "base_price": current_prices.get(ticker),
             "thesis": line.strip("- ").strip(),
             "source": "gemini_report",
+            "confidence": confidence,
         })
 
     return predictions
+
+
+def extract_prediction_reviews(report: str) -> list[dict]:
+    """Parsuje krótkie, dowodowe wyjaśnienia wyników z sobotniej sekcji AI."""
+    review_re = re.compile(
+        r"^\s*-\s*\**(?P<date>\d{4}-\d{2}-\d{2})\**\s+\**(?P<ticker>[A-Z0-9.]+)\**:\s*"
+        r"wynik\s*[=:]\s*(?P<verdict>trafiona|nietrafiona|hit|miss)\s*;\s*"
+        r"(?:wyjaśnienie|wyjasnienie)\s*[=:]\s*(?P<explanation>.*?)\s*;\s*"
+        r"(?:(?:przeważyło|przewazylo)\s*[=:]\s*(?P<driver>.*?)\s*;\s*)?"
+        r"lekcja\s*[=:]\s*(?P<lesson>.+?)\s*$",
+        re.IGNORECASE,
+    )
+    reviews = []
+    for line in report.splitlines():
+        match = review_re.match(line)
+        if not match:
+            continue
+        reviews.append({
+            "date": match.group("date"),
+            "ticker": match.group("ticker"),
+            "verdict": match.group("verdict").lower(),
+            "outcome_explanation": match.group("explanation").strip(),
+            "week_driver": (match.group("driver") or "").strip(),
+            "lesson": match.group("lesson").strip(),
+        })
+    return reviews
 
 
 def save_predictions(predictions: list[dict]) -> None:
@@ -236,13 +270,14 @@ def save_predictions(predictions: list[dict]) -> None:
     fieldnames = PREDICTION_FIELDNAMES
     existing_rows = []
     today = warsaw_now().strftime("%Y-%m-%d")
-    tickers = {p.get("ticker") for p in predictions}
+    keys = {(p.get("date", today), p.get("ticker"), p.get("source", "")) for p in predictions}
 
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8", newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                if row.get("date") == today and row.get("ticker") in tickers:
+                row_key = (row.get("date"), row.get("ticker"), row.get("source", ""))
+                if row_key in keys:
                     continue
                 existing_rows.append(row)
 
@@ -283,22 +318,21 @@ def evaluate_previous_predictions(dry_run: bool = False) -> dict:
     dzieki czemu kazda prognoza liczy sie do statystyk dokladnie raz.
 
     Prognozy sa TYGODNIOWE (sobotnie) — wiersze z datami nie-sobotnimi (era prognoz
-    dziennych) oraz tickerami spoza aktualnego portfela sa usuwane przy zapisie.
+    dziennych) sa usuwane przy zapisie. Historyczne tickery pozostają, aby zmiana
+    portfela nie kasowała materiału do oceny.
 
     dry_run=True (np. --preview): liczy wyniki, ale NIE modyfikuje pliku CSV.
 
     Zwraca: {"new": [rozliczone w tym biegu], "total_hits": int,
-             "total_evaluated": int, "pending": int}
+             "total_evaluated": int, "pending": int, "stats": dict}
     """
     path = get_predictions_file_path()
-    empty = {"new": [], "total_hits": 0, "total_evaluated": 0, "pending": 0}
+    empty = {"new": [], "total_hits": 0, "total_evaluated": 0, "pending": 0, "stats": {}}
     if not os.path.exists(path):
         return empty
 
     today = warsaw_today()
     cutoff_str = (today - timedelta(days=PREDICTION_RETENTION_DAYS)).strftime("%Y-%m-%d")
-    portfolio = set(US_TICKERS) | set(GPW_TICKERS_MAP.keys())
-
     rows = []
     with open(path, "r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
@@ -306,10 +340,9 @@ def evaluate_previous_predictions(dry_run: bool = False) -> dict:
             # Retencja — wiersze starsze niz PREDICTION_RETENTION_DAYS wypadaja z pliku
             if row.get("date") and row["date"] < cutoff_str:
                 continue
-            # Czystka: tylko prognozy sobotnie (cykl tygodniowy) i tylko aktualny portfel
+            # Czystka: tylko prognozy sobotnie (cykl tygodniowy). Historyczne tickery
+            # są zachowywane nawet po usunięciu z watchlisty.
             if row.get("date") and not _is_saturday_date(row["date"]):
-                continue
-            if row.get("ticker") and row["ticker"] not in portfolio:
                 continue
             rows.append(row)
 
@@ -383,6 +416,10 @@ def evaluate_previous_predictions(dry_run: bool = False) -> dict:
             "hit": hit,
             "thesis": row.get("thesis", ""),
             "source": row.get("source", ""),
+            "forecast_context": row.get("forecast_context", ""),
+            "outcome_explanation": row.get("outcome_explanation", ""),
+            "week_driver": row.get("week_driver", ""),
+            "lesson": row.get("lesson", ""),
         })
 
     # Zapis pliku (nowe kolumny + retencja + czystka) — pomijany w dry_run (--preview)
@@ -401,6 +438,7 @@ def evaluate_previous_predictions(dry_run: bool = False) -> dict:
 
     evaluated_rows = [r for r in rows if r.get("evaluated_date")]
     total_hits = sum(1 for r in evaluated_rows if str(r.get("hit")) in ("1", "True", "true"))
+    stats = _calculate_accuracy_stats(evaluated_rows)
     if changed and not dry_run:
         logger.info(f"Rozliczono {len(new_evaluations)} prognoz (lacznie: {total_hits}/{len(evaluated_rows)}).")
     return {
@@ -408,7 +446,117 @@ def evaluate_previous_predictions(dry_run: bool = False) -> dict:
         "total_hits": total_hits,
         "total_evaluated": len(evaluated_rows),
         "pending": pending,
+        "stats": stats,
     }
+
+
+def _calculate_accuracy_stats(rows: list[dict]) -> dict:
+    """Statystyki porównywalne między źródłami, kierunkami i rynkami."""
+    groups = {"source": {}, "direction": {}, "market": {}}
+    for row in rows:
+        hit = str(row.get("hit")) in ("1", "True", "true")
+        ticker = row.get("ticker", "")
+        keys = {
+            "source": row.get("source") or "unknown",
+            "direction": row.get("direction") or DIRECTION_NEUTRAL,
+            "market": "GPW" if ticker.endswith(".WA") else "USA",
+        }
+        for dimension, key in keys.items():
+            item = groups[dimension].setdefault(key, {"hits": 0, "total": 0})
+            item["total"] += 1
+            item["hits"] += int(hit)
+    return groups
+
+
+def load_accuracy_feedback(limit: int = 20) -> dict:
+    """Buduje zwięzły, historyczny kontekst dla sobotniego prompta Gemini."""
+    path = get_predictions_file_path()
+    if not os.path.exists(path):
+        return {"summary": "Brak historii prognoz.", "lessons": []}
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        rows = list(csv.DictReader(f))
+    evaluated = [row for row in rows if row.get("evaluated_date")]
+    stats = _calculate_accuracy_stats(evaluated)
+    summary_parts = []
+    for dimension in ("source", "direction", "market"):
+        chunks = []
+        for key, item in sorted(stats[dimension].items()):
+            pct = item["hits"] / item["total"] * 100 if item["total"] else 0
+            sample_note = " (mała próba)" if item["total"] < 20 else ""
+            chunks.append(f"{key}: {item['hits']}/{item['total']} ({pct:.0f}%){sample_note}")
+        if chunks:
+            summary_parts.append(f"{dimension}: " + "; ".join(chunks))
+
+    reviewed = [
+        row for row in evaluated
+        if row.get("lesson") or row.get("outcome_explanation")
+    ]
+    reviewed.sort(key=lambda row: (row.get("date", ""), row.get("ticker", "")), reverse=True)
+    lessons = [
+        f"{row.get('date', 'b/d')} {row.get('ticker', 'b/d')}: "
+        f"{row.get('outcome_explanation') or 'brak wyjaśnienia'}; "
+        f"przeważyło: {row.get('week_driver') or 'b/d'}; "
+        f"lekcja: {row.get('lesson') or 'brak'}"
+        for row in reviewed[:limit]
+    ]
+
+    # Do czasu zapełnienia pola lesson model nadal widzi surowe, rozliczone
+    # wyniki i tezy, więc pętla działa także na starszym CSV.
+    if not lessons:
+        legacy = sorted(evaluated, key=lambda row: row.get("date", ""), reverse=True)
+        lessons = [
+            f"{row.get('date', 'b/d')} {row.get('ticker', 'b/d')}: "
+            f"kierunek={row.get('direction', 'b/d')}, ruch={row.get('realized_pct', 'b/d')}%, "
+            f"wynik={'trafiona' if str(row.get('hit')) == '1' else 'nietrafiona'}; "
+            f"teza={row.get('thesis', '')}"
+            for row in legacy[:limit]
+        ]
+    return {
+        "summary": " | ".join(summary_parts) if summary_parts else "Brak rozliczonych prognoz.",
+        "lessons": lessons,
+    }
+
+
+def record_prediction_reviews(reviews: list[dict]) -> int:
+    """Zapisuje wyłącznie zgodne, parsowalne recenzje prognoz Gemini."""
+    if not reviews:
+        return 0
+    path = get_predictions_file_path()
+    if not os.path.exists(path):
+        return 0
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        rows = list(csv.DictReader(f))
+    today = warsaw_today().strftime("%Y-%m-%d")
+    review_map = {(r.get("date"), r.get("ticker")): r for r in reviews}
+    changed = 0
+    for row in rows:
+        key = (row.get("date"), row.get("ticker"))
+        review = review_map.get(key)
+        if not review or row.get("source") != "gemini_report" or not row.get("evaluated_date"):
+            continue
+        expected = "trafiona" if str(row.get("hit")) == "1" else "nietrafiona"
+        verdict = review.get("verdict", "").lower()
+        verdict = "trafiona" if verdict == "hit" else "nietrafiona" if verdict == "miss" else verdict
+        if verdict != expected:
+            logger.warning(f"Pomijam niespójny review prognozy {key}: {verdict} != {expected}")
+            continue
+        row["reviewed_date"] = today
+        row["outcome_explanation"] = review.get("outcome_explanation", "")
+        row["week_driver"] = review.get("week_driver", "")
+        row["lesson"] = review.get("lesson", "")
+        changed += 1
+    if not changed:
+        return 0
+    try:
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=PREDICTION_FIELDNAMES, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({key: row.get(key, "") for key in PREDICTION_FIELDNAMES})
+    except Exception as exc:
+        logger.error(f"Błąd zapisu review prognoz: {exc}")
+        return 0
+    return changed
 
 
 def format_accuracy_section(result: dict) -> str:
@@ -441,6 +589,13 @@ def format_accuracy_section(result: dict) -> str:
                     f"- **{item['ticker']}**: {item['direction']} -> "
                     f"{item['realized_pct']:+.2f}% na koniec horyzontu{threshold_txt}; {verdict}."
                 )
+                explanation = item.get("outcome_explanation") or ""
+                driver = item.get("week_driver") or ""
+                if explanation or driver:
+                    extra = explanation or "brak wyjaśnienia"
+                    if driver:
+                        extra += f" Przeważyło: {driver}"
+                    lines.append(f"  {extra}")
             lines.append("")
     else:
         lines.append("*Brak nowych prognoz rozliczonych w tym tygodniu.*")
@@ -454,4 +609,12 @@ def format_accuracy_section(result: dict) -> str:
         pct = total_hits / total_evaluated * 100
         lines.append(f"Skutecznosc lacznie (prognozy sobotnie): **{total_hits}/{total_evaluated}** ({pct:.0f}%).")
         lines.append("")
+        stats = result.get("stats") or {}
+        if stats.get("source"):
+            lines.append("**Porównanie źródeł:**")
+            for source, item in sorted(stats["source"].items()):
+                source_pct = item["hits"] / item["total"] * 100 if item["total"] else 0
+                sample_note = " — mała próba" if item["total"] < 20 else ""
+                lines.append(f"- {source}: {item['hits']}/{item['total']} ({source_pct:.0f}%){sample_note}")
+            lines.append("")
     return "\n".join(lines)

@@ -2,6 +2,7 @@ import yfinance as yf
 from datetime import datetime, timedelta
 from typing import Optional
 import os
+import re
 import time
 import concurrent.futures
 import numpy as np
@@ -108,6 +109,7 @@ TICKER_NAMES = {
     "PEO.WA": "Bank Pekao",
     "NBIS": "Nebius Group",
     "AMKR": "Amkor Technology",
+    "ASYS": "Amtech Systems",
 }
 
 for t, name in GPW_TICKERS_MAP.items():
@@ -449,6 +451,234 @@ def fetch_analyst_recommendations(ticker: str) -> dict:
     return out
 
 
+SEC_USER_AGENT = (
+    "MarketReportEngine/1.0 (https://github.com/Mantix46/market-report-engine)"
+)
+FORM4_FILING_LIMIT = 8
+_PRICE_IN_TEXT_RE = re.compile(
+    r"at price\s+([\d.,]+)(?:\s*-\s*([\d.,]+))?\s+per share",
+    re.IGNORECASE,
+)
+
+
+def _cell_str(value) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return str(value).strip()
+
+
+def _is_non_market_transaction(text: str) -> bool:
+    t = (text or "").lower()
+    return any(token in t for token in (
+        "award", "grant", "gift", "tax withholding",
+        "conversion of exercise", "exercise of derivative",
+    ))
+
+
+def _transaction_side(text: str) -> str:
+    t = (text or "").lower()
+    if _is_non_market_transaction(text):
+        return "other"
+    if "sale" in t or "sell" in t:
+        return "sell"
+    if "purchase" in t or "buy" in t:
+        return "buy"
+    return "other"
+
+
+def _parse_value_from_text(text: str, shares: int) -> Optional[float]:
+    if not shares:
+        return None
+    match = _PRICE_IN_TEXT_RE.search(text or "")
+    if not match:
+        return None
+    try:
+        low = float(match.group(1).replace(",", ""))
+        high = float(match.group(2).replace(",", "")) if match.group(2) else low
+    except Exception:
+        return None
+    if low <= 0 and high <= 0:
+        return None
+    return shares * ((low + high) / 2.0)
+
+
+def _parse_row_value(row, shares: int, transaction: str, last_price) -> Optional[float]:
+    raw = row.get("Value")
+    try:
+        value = float(raw) if raw is not None and not pd.isna(raw) else None
+    except Exception:
+        value = None
+    if value is not None and value > 0:
+        return value
+    side = _transaction_side(transaction)
+    if side == "other":
+        return 0.0 if value == 0 else None
+    text_value = _parse_value_from_text(transaction, shares)
+    if text_value:
+        return text_value
+    if shares and last_price:
+        return float(shares) * float(last_price)
+    return None
+
+
+def _trade_date_key(value) -> str:
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        return ""
+    return parsed.strftime("%Y-%m-%d")
+
+
+def _norm_name(name: str) -> str:
+    return re.sub(r"[^a-z]", "", (name or "").lower())
+
+
+def form4_txt_url(index_url: str) -> Optional[str]:
+    if not index_url:
+        return None
+    if index_url.endswith("-index.html"):
+        return index_url[:-11] + ".txt"
+    if index_url.endswith("-index.htm"):
+        return index_url[:-10] + ".txt"
+    return index_url
+
+
+def parse_form4_plan_flag(filing_text: str) -> Optional[bool]:
+    """True = 10b5-1, False = filing bez planu, None = nie da się odczytać."""
+    if not filing_text:
+        return None
+    match = re.search(
+        r"<aff10b5One>\s*(true|false|1|0)\s*</aff10b5One>",
+        filing_text,
+        re.IGNORECASE,
+    )
+    if match:
+        return match.group(1).lower() in ("true", "1")
+    if re.search(r"10b5-1", filing_text, re.IGNORECASE):
+        return True
+    if "<ownershipDocument" in filing_text or re.search(r"\bFORM\s*4\b", filing_text, re.IGNORECASE):
+        return False
+    return None
+
+
+def fetch_fmp_insider_trades(ticker: str, cutoff) -> list[dict]:
+    if not FMP_API_KEY or ticker.endswith(".WA"):
+        return []
+    symbol = ticker.replace(".WA", "")
+    try:
+        response = requests.get(
+            "https://financialmodelingprep.com/stable/insider-trading/search",
+            params={"symbol": symbol, "page": 0, "limit": 100, "apikey": FMP_API_KEY},
+            timeout=12,
+        )
+        if response.status_code in (401, 402, 403):
+            logger.info(f"FMP insider trades niedostępne (status {response.status_code})")
+            return []
+        if not response.ok:
+            return []
+        rows = response.json() or []
+    except Exception as exc:
+        logger.warning(f"Błąd FMP insiderów dla {ticker}: {exc}")
+        return []
+
+    cutoff_str = cutoff.strftime("%Y-%m-%d")
+    out = []
+    for item in rows:
+        date_key = _trade_date_key(item.get("transactionDate"))
+        if date_key and date_key < cutoff_str:
+            continue
+        out.append({
+            "date": date_key,
+            "name": item.get("reportingName") or "",
+            "type": str(item.get("transactionType") or ""),
+            "shares": item.get("securitiesTransacted"),
+            "link": item.get("link") or "",
+        })
+    return out
+
+
+def fetch_form4_plan_map(fmp_trades: list[dict], max_filings: int = FORM4_FILING_LIMIT) -> dict:
+    flags = {}
+    fetched = 0
+    for trade in fmp_trades:
+        link = trade.get("link") or ""
+        txt_url = form4_txt_url(link)
+        if not txt_url or txt_url in flags:
+            continue
+        if fetched >= max_filings:
+            break
+        fetched += 1
+        try:
+            response = requests.get(
+                txt_url,
+                headers={"User-Agent": SEC_USER_AGENT, "Accept-Encoding": "gzip, deflate"},
+                timeout=12,
+            )
+            flag = parse_form4_plan_flag(response.text) if response.ok else None
+        except Exception as exc:
+            logger.debug(f"Form 4 {txt_url}: {exc}")
+            flag = None
+        flags[txt_url] = flag
+        if link:
+            flags[link] = flag
+        time.sleep(0.15)
+    return flags
+
+
+def _fmp_type_matches_side(transaction_type: str, side: str) -> bool:
+    t = (transaction_type or "").lower()
+    if side == "sell":
+        return "sale" in t or t.startswith("s-") or t == "s"
+    if side == "buy":
+        return "purchase" in t or t.startswith("p-") or t == "p"
+    return False
+
+
+def classify_plan_for_row(row_date, insider_name, shares, side, fmp_trades, plan_flags) -> str:
+    if side not in ("buy", "sell"):
+        return "other"
+    if not fmp_trades:
+        return "unknown"
+    date_key = _trade_date_key(row_date)
+    name_key = _norm_name(insider_name)
+    matches = []
+    for trade in fmp_trades:
+        if trade.get("date") != date_key:
+            continue
+        if not _fmp_type_matches_side(trade.get("type") or "", side):
+            continue
+        trade_name = _norm_name(trade.get("name") or "")
+        name_hit = bool(name_key and trade_name and (name_key in trade_name or trade_name in name_key))
+        try:
+            trade_shares = float(trade.get("shares") or 0)
+        except Exception:
+            trade_shares = 0.0
+        shares_hit = bool(
+            shares and trade_shares and abs(trade_shares - shares) / max(abs(shares), 1) < 0.05
+        )
+        if name_hit or shares_hit:
+            matches.append(trade)
+    if not matches:
+        return "unknown"
+    saw_unplanned = False
+    for trade in matches:
+        link = trade.get("link") or ""
+        flag = plan_flags.get(link)
+        if flag is None:
+            flag = plan_flags.get(form4_txt_url(link) or "")
+        if flag is True:
+            return "planned"
+        if flag is False:
+            saw_unplanned = True
+    if saw_unplanned:
+        return "discretionary"
+    return "unknown"
+
+
 def fetch_fundamentals_short_insider(ticker: str) -> dict:
     """Fetch fundamentals, short interest and a richer insider/smart-money summary."""
     try:
@@ -472,55 +702,102 @@ def fetch_fundamentals_short_insider(ticker: str) -> dict:
         sell_value_90d = 0.0
         recent_buys_90d = 0
         recent_sales_90d = 0
+        recent_other_90d = 0
+        recent_total_90d = 0
+        planned_buy_value_90d = 0.0
+        planned_sell_value_90d = 0.0
+        discretionary_buy_value_90d = 0.0
+        discretionary_sell_value_90d = 0.0
+        unknown_buy_value_90d = 0.0
+        unknown_sell_value_90d = 0.0
+        planned_buys_90d = 0
+        planned_sales_90d = 0
+        discretionary_buys_90d = 0
+        discretionary_sales_90d = 0
+        insider_data_status = "available"
+        insider_data_source = "Yahoo Finance"
         cutoff = warsaw_today() - timedelta(days=90)
 
         try:
             insider_df = t.insider_transactions
-            if insider_df is not None and not insider_df.empty:
-                for _, row in insider_df.head(12).iterrows():
-                    transaction = str(row.get("Transaction", "") or "")
+            if insider_df is None or insider_df.empty:
+                # Yahoo nie zwraca tabel insiderów dla tickerów GPW. To nie jest
+                # równoznaczne z zerową aktywnością i nie może być tak pokazane.
+                insider_data_status = "unavailable" if ticker.endswith(".WA") else "no_open_market_trades"
+            else:
+                fmp_trades = fetch_fmp_insider_trades(ticker, cutoff)
+                plan_flags = fetch_form4_plan_map(fmp_trades) if fmp_trades else {}
+                if fmp_trades:
+                    insider_data_source = "Yahoo Finance + FMP/Form 4"
+
+                for _, row in insider_df.iterrows():
+                    transaction_value = row.get("Transaction")
+                    if not _cell_str(transaction_value):
+                        transaction_value = row.get("Text")
+                    transaction = _cell_str(transaction_value)
                     shares = row.get("Shares", 0) or 0
                     try:
                         shares = int(shares)
                     except Exception:
                         shares = 0
 
-                    # Wartość transakcji — sygnał ważymy pieniędzmi, nie sztukami
-                    # (10 000 akcji po $2 to nie to samo co 10 000 po $500)
-                    value = row.get("Value")
-                    try:
-                        value = float(value) if value is not None and not pd.isna(value) else None
-                    except Exception:
-                        value = None
-                    if not value and shares and price:
-                        value = shares * price
-
+                    value = _parse_row_value(row, shares, transaction, price)
                     raw_date = row.get("Start Date", "")
                     parsed_date = pd.to_datetime(raw_date, errors="coerce")
                     is_recent = bool(not pd.isna(parsed_date) and parsed_date.date() >= cutoff)
-                    transaction_l = transaction.lower()
+                    if not is_recent:
+                        continue
 
-                    if "sale" in transaction_l or "sell" in transaction_l:
-                        if is_recent:
-                            sell_shares_90d += shares
-                            sell_value_90d += value or 0.0
-                            recent_sales_90d += 1
-                    elif "purchase" in transaction_l or "buy" in transaction_l:
-                        if is_recent:
-                            buy_shares_90d += shares
-                            buy_value_90d += value or 0.0
-                            recent_buys_90d += 1
+                    side = _transaction_side(transaction)
+                    plan = classify_plan_for_row(
+                        raw_date, _cell_str(row.get("Insider")), shares, side,
+                        fmp_trades, plan_flags,
+                    )
+                    recent_total_90d += 1
+                    if side == "sell":
+                        sell_shares_90d += shares
+                        sell_value_90d += value or 0.0
+                        recent_sales_90d += 1
+                        if plan == "planned":
+                            planned_sell_value_90d += value or 0.0
+                            planned_sales_90d += 1
+                        elif plan == "discretionary":
+                            discretionary_sell_value_90d += value or 0.0
+                            discretionary_sales_90d += 1
+                        else:
+                            unknown_sell_value_90d += value or 0.0
+                    elif side == "buy":
+                        buy_shares_90d += shares
+                        buy_value_90d += value or 0.0
+                        recent_buys_90d += 1
+                        if plan == "planned":
+                            planned_buy_value_90d += value or 0.0
+                            planned_buys_90d += 1
+                        elif plan == "discretionary":
+                            discretionary_buy_value_90d += value or 0.0
+                            discretionary_buys_90d += 1
+                        else:
+                            unknown_buy_value_90d += value or 0.0
+                    else:
+                        recent_other_90d += 1
+                        plan = "other"
 
-                    insiders.append({
-                        "insider": row.get("Insider", ""),
-                        "position": row.get("Position", ""),
-                        "transaction": transaction,
-                        "shares": shares,
-                        "value": round(value, 0) if value else None,
-                        "date": str(raw_date),
-                    })
-        except Exception:
-            pass
+                    if len(insiders) < 5:
+                        insiders.append({
+                            "insider": _cell_str(row.get("Insider")),
+                            "position": _cell_str(row.get("Position")),
+                            "transaction": transaction,
+                            "shares": shares,
+                            "value": round(value, 0) if value is not None else None,
+                            "date": _trade_date_key(raw_date) or _cell_str(raw_date),
+                            "plan": plan,
+                        })
+
+                if recent_buys_90d == 0 and recent_sales_90d == 0:
+                    insider_data_status = "no_open_market_trades"
+        except Exception as exc:
+            insider_data_status = "error"
+            logger.warning(f"Błąd pobierania insiderów dla {ticker}: {exc}")
 
         net_shares_90d = buy_shares_90d - sell_shares_90d
         # Sygnał na podstawie WARTOŚCI transakcji (nie liczby akcji)
@@ -569,8 +846,22 @@ def fetch_fundamentals_short_insider(ticker: str) -> dict:
                 "net_shares_90d": net_shares_90d,
                 "recent_buys_90d": recent_buys_90d,
                 "recent_sales_90d": recent_sales_90d,
+                "recent_other_90d": recent_other_90d,
+                "recent_total_90d": recent_total_90d,
+                "planned_buy_value_90d": round(planned_buy_value_90d, 0),
+                "planned_sell_value_90d": round(planned_sell_value_90d, 0),
+                "discretionary_buy_value_90d": round(discretionary_buy_value_90d, 0),
+                "discretionary_sell_value_90d": round(discretionary_sell_value_90d, 0),
+                "unknown_buy_value_90d": round(unknown_buy_value_90d, 0),
+                "unknown_sell_value_90d": round(unknown_sell_value_90d, 0),
+                "planned_buys_90d": planned_buys_90d,
+                "planned_sales_90d": planned_sales_90d,
+                "discretionary_buys_90d": discretionary_buys_90d,
+                "discretionary_sales_90d": discretionary_sales_90d,
             },
             "insider_signal": insider_signal,
+            "insider_data_status": insider_data_status,
+            "insider_data_source": insider_data_source,
         }
     except Exception as e:
         logger.warning(f"Blad fundamentals dla {ticker}: {e}")
@@ -595,6 +886,8 @@ def fetch_fundamentals_short_insider(ticker: str) -> dict:
             "insider_transactions": [],
             "insider_summary": {},
             "insider_signal": "neutral",
+            "insider_data_status": "error",
+            "insider_data_source": "Yahoo Finance",
         }
 
 

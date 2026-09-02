@@ -208,13 +208,40 @@ def test_saturday_basic_report(sample_data, monkeypatch):
     md = layout_v2.render_basic_report_v2(sample_data)
     assert "## Analiza trendu (tygodniowa)" in md
     assert "Trafnosc prognoz tygodniowych" in md
+    assert layout_v2.PREDICTION_REVIEW_HEADER in md
     assert "## Prognozy do weryfikacji" in md
+    assert md.find("## Analiza trendu") < md.find("### Trafnosc prognoz tygodniowych")
+    assert md.find("### Trafnosc prognoz tygodniowych") < md.find(layout_v2.PREDICTION_REVIEW_HEADER)
+    assert md.find(layout_v2.PREDICTION_REVIEW_HEADER) < md.find("## Prognozy do weryfikacji")
     assert not saved  # persist=False -> brak zapisu prognoz
 
     # format bulletów musi łapać prawdziwy parser accuracy_trackera
     from accuracy_tracker import extract_predictions_from_report
     parsed = extract_predictions_from_report(md, ["MU", "XTB.WA"], {"MU": 100.0})
     assert len(parsed) == 1 and parsed[0]["ticker"] == "MU" and parsed[0]["direction"] == "up"
+
+
+def test_saturday_prompt_contains_feedback_and_upcoming_events(sample_data):
+    sample_data["is_saturday"] = True
+    sample_data["prediction_evaluation"] = {
+        "new": [{"prediction_date": "2026-07-04", "ticker": "MU",
+                 "source": "gemini_report", "direction": "up", "realized_pct": -4.2,
+                 "horizon_price": 95.8, "threshold_pct": 2.1,
+                 "hit": False, "thesis": "odbicie od SMA20"}]
+    }
+    sample_data["prediction_feedback"] = {
+        "summary": "gemini_report: 1/2 (50%)",
+        "lessons": ["2026-06-27 MU: brak katalizatora; lekcja: nie przeceniać techniki"],
+    }
+    prompt = layout_v2._build_prompt_v2(sample_data)
+    assert layout_v2.PREDICTION_REVIEW_HEADER in prompt
+    assert "NOWE ROZLICZENIA DO ANALIZY" in prompt
+    assert "próg_ATR=2.1%" in prompt
+    assert "nie przeceniać techniki" in prompt
+    assert "2026-07-12" in prompt  # nadchodzące wyniki
+    assert "CPI (inflacja US)" in prompt  # nadchodzące makro
+    assert "KAŻDEJ aktywnej spółki" in prompt
+    assert "MU" in prompt and "XTB.WA" in prompt
 
 
 def test_saturday_basic_report_persist_saves(sample_data, monkeypatch):
@@ -234,6 +261,122 @@ def test_non_saturday_has_no_saturday_sections(sample_data):
     md = layout_v2.render_basic_report_v2(sample_data)
     assert "Analiza trendu" not in md
     assert "Prognozy do weryfikacji" not in md
+
+
+def test_insider_lines_avoid_zero_million_and_label_plan():
+    from report_builder import format_insider_lines, format_money_amount
+
+    assert format_money_amount(0, "USD") == "brak"
+    assert format_money_amount(49456, "USD") == "49.5 tys. USD"
+    assert "mln" in format_money_amount(38_756_162, "USD")
+
+    fund = {
+        "insider_data_status": "available",
+        "insider_data_source": "Yahoo Finance + FMP/Form 4",
+        "insider_signal": "recent_selling_pressure",
+        "insider_summary": {
+            "buy_value_90d": 0,
+            "sell_value_90d": 182_000_000,
+            "recent_buys_90d": 0,
+            "recent_sales_90d": 3,
+            "planned_sell_value_90d": 150_000_000,
+            "discretionary_sell_value_90d": 32_000_000,
+            "unknown_sell_value_90d": 0,
+        },
+        "insider_transactions": [{
+            "insider": "MEHROTRA SANJAY",
+            "transaction": "Sale at price 959.14 per share.",
+            "shares": 40000,
+            "value": 38_756_162,
+            "date": "2026-08-21",
+            "plan": "planned",
+        }],
+    }
+    lines = "\n".join(format_insider_lines("MU", fund))
+    assert "kupno 0" not in lines
+    assert "brak zakupów" in lines
+    assert "sprzedaż" in lines
+    assert "zaplanowane" in lines
+    assert "nagłe" in lines
+    assert "MEHROTRA SANJAY" in lines
+    assert "zaplanowane 10b5-1" in lines
+
+
+def test_saturday_fallback_reviews_include_driver(sample_data, monkeypatch):
+    sample_data["is_saturday"] = True
+    sample_data["persist"] = False
+    sample_data["portfolio_details"]["MU"]["technicals"]["change_5d"] = -4.2
+    sample_data["prediction_evaluation"] = {
+        "new": [{
+            "prediction_date": "2026-07-04",
+            "ticker": "MU",
+            "source": "gemini_report",
+            "direction": "up",
+            "realized_pct": -4.2,
+            "horizon_price": 95.8,
+            "threshold_pct": 2.1,
+            "hit": False,
+            "thesis": "odbicie od SMA20",
+        }]
+    }
+    monkeypatch.setattr(layout_v2, "evaluate_previous_predictions", lambda dry_run: sample_data["prediction_evaluation"])
+    monkeypatch.setattr(layout_v2, "format_accuracy_section", lambda result: "*mock*")
+    md = layout_v2.render_basic_report_v2(sample_data)
+    assert "wynik=nietrafiona" in md
+    assert "przeważyło=" in md
+    assert "Micron beats estimates" in md
+
+
+def test_monitoring_injects_deterministic_insider_line(sample_data):
+    sample_data["portfolio_details"]["MU"]["fundamentals"] = {
+        "insider_data_status": "available",
+        "insider_data_source": "Yahoo Finance",
+        "insider_signal": "recent_selling_pressure",
+        "insider_summary": {
+            "buy_value_90d": 0,
+            "sell_value_90d": 182_160_000,
+            "recent_buys_90d": 0,
+            "recent_sales_90d": 10,
+        },
+        "insider_transactions": [],
+    }
+    section = (
+        "## 4. Monitoring spółek\n\n"
+        "**Micron Technology (MU) [-2.64%, Cena: 933.44 USD]:**\n"
+        "Transakcje insiderów (90d) wyniosły 0.00 mln USD. Wyniki za kolejny kwartał zostaną opublikowane 2026-09-30.\n"
+        "**Wpływ: pozytywny**\n"
+    )
+    out = layout_v2._with_insider_facts(section, sample_data)
+    assert "Insiderzy 90d:" in out
+    assert "sprzedaż" in out
+    assert "182.16 mln USD" in out
+    assert out.find("Insiderzy 90d:") < out.find("**Wpływ:")
+
+
+def test_saturday_prompt_forbids_zero_usd_and_has_week_facts(sample_data):
+    sample_data["is_saturday"] = True
+    sample_data["prediction_evaluation"] = {
+        "new": [{
+            "prediction_date": "2026-07-04",
+            "ticker": "MU",
+            "source": "gemini_report",
+            "direction": "up",
+            "realized_pct": -4.2,
+            "base_price": 100,
+            "horizon_price": 95.8,
+            "threshold_pct": 2.1,
+            "hit": False,
+            "thesis": "odbicie od SMA20",
+            "forecast_context": "{\"news\":[]}",
+        }]
+    }
+    sample_data["prediction_feedback"] = {"summary": "b/d", "lessons": []}
+    prompt = layout_v2._build_prompt_v2(sample_data)
+    assert 'NIE opisuj jako "0 USD"' in prompt or "NIE opisuj jako \"0 USD\"" in prompt
+    assert "przeważyło=" in prompt
+    assert "tydzień=" in prompt
+    assert "kontekst_z_dnia_prognozy=" in prompt
+    assert "10b5-1" in prompt
 
 
 def test_basic_company_impact_rules():

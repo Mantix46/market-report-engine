@@ -327,32 +327,6 @@ def test_saturday_fallback_reviews_include_driver(sample_data, monkeypatch):
     assert "Micron beats estimates" in md
 
 
-def test_monitoring_injects_deterministic_insider_line(sample_data):
-    sample_data["portfolio_details"]["MU"]["fundamentals"] = {
-        "insider_data_status": "available",
-        "insider_data_source": "Yahoo Finance",
-        "insider_signal": "recent_selling_pressure",
-        "insider_summary": {
-            "buy_value_90d": 0,
-            "sell_value_90d": 182_160_000,
-            "recent_buys_90d": 0,
-            "recent_sales_90d": 10,
-        },
-        "insider_transactions": [],
-    }
-    section = (
-        "## 4. Monitoring spółek\n\n"
-        "**Micron Technology (MU) [-2.64%, Cena: 933.44 USD]:**\n"
-        "Transakcje insiderów (90d) wyniosły 0.00 mln USD. Wyniki za kolejny kwartał zostaną opublikowane 2026-09-30.\n"
-        "**Wpływ: pozytywny**\n"
-    )
-    out = layout_v2._with_insider_facts(section, sample_data)
-    assert "Insiderzy 90d:" in out
-    assert "sprzedaż" in out
-    assert "182.16 mln USD" in out
-    assert out.find("Insiderzy 90d:") < out.find("**Wpływ:")
-
-
 def test_saturday_prompt_forbids_zero_usd_and_has_week_facts(sample_data):
     sample_data["is_saturday"] = True
     sample_data["prediction_evaluation"] = {

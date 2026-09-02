@@ -21,7 +21,6 @@ Gemini i zapisuje zarówno benchmark techniczny, jak i prognozę wieloczynnikow�
 """
 
 import os
-import re
 import json
 import time
 import logging
@@ -846,46 +845,6 @@ def _saturday_extras_md(data: dict) -> str:
     return md
 
 
-def _insider_fact_bullet(ticker: str, fund: dict) -> str:
-    text = " ".join(line.strip() for line in format_insider_lines(ticker, fund))
-    if text.lower().startswith("insiderzy 90d:"):
-        text = "Insiderzy 90d:" + text[len("insiderzy 90d:"):]
-    return f"- {text}"
-
-
-def _with_insider_facts(section: str, data: dict) -> str:
-    """Dokleja twarde liczby insiderów pod nagłówkiem spółki — Gemini nie może ich nadpisać."""
-    facts = {}
-    for ticker in data.get("active_tickers") or []:
-        fund = ((data.get("portfolio_details") or {}).get(ticker) or {}).get("fundamentals") or {}
-        facts[ticker] = _insider_fact_bullet(ticker, fund)
-
-    header_re = re.compile(
-        r"(^\*\*[^*]+?\(([A-Z0-9.]+)\)[^*]*:\*\*[^\n]*)",
-        re.MULTILINE,
-    )
-
-    def _inject(match: re.Match) -> str:
-        ticker = match.group(2)
-        fact = facts.get(ticker)
-        if not fact or fact in match.string[match.end():match.end() + 400]:
-            return match.group(1)
-        return match.group(1) + "\n" + fact
-
-    updated = header_re.sub(_inject, section)
-    # Fallback v1/regułowy: nagłówek ### Nazwa (TICKER)
-    h2_re = re.compile(r"(^### [^\n]*\(([A-Z0-9.]+)\)[^\n]*)", re.MULTILINE)
-
-    def _inject_h2(match: re.Match) -> str:
-        ticker = match.group(2)
-        fact = facts.get(ticker)
-        if not fact or fact in match.string[match.end():match.end() + 400]:
-            return match.group(1)
-        return match.group(1) + "\n" + fact
-
-    return h2_re.sub(_inject_h2, updated)
-
-
 def _assemble_report(data: dict, ai_sections: dict) -> str:
     """Składa finalny raport v2: nagłówek + sekcje 1-10 w kolejności + disclaimer.
     W sobotę dodatkowo: analiza trendu, trafność prognoz i prognozy do weryfikacji."""
@@ -902,7 +861,7 @@ def _assemble_report(data: dict, ai_sections: dict) -> str:
         build_macro_md(data),
         "---",
         "",
-        _with_insider_facts(ai_sections["## 4. Monitoring spółek"], data),
+        ai_sections["## 4. Monitoring spółek"],
         "",
         "---",
         "",
@@ -1076,8 +1035,6 @@ def _basic_monitoring(data: dict) -> str:
         for rl in rec_lines:
             if "brak danych analitycznych" not in rl:
                 lines.append(f"- {rl.strip()}")
-        fund = details.get("fundamentals") or {}
-        lines.append(_insider_fact_bullet(t, fund))
         note = TICKER_NOTES.get(t)
         if note:
             lines.append(f"> {note}")

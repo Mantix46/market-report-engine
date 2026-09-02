@@ -16,11 +16,12 @@ Struktura (celowo INNA niż v1 — patrz skill report-style, sekcja "Layout v2")
  9. Sentyment                  (AI, proxy: VIX/short/insider/wolumen/rekomendacje)
 10. Watchlist                  (AI)
 
-v2 NIE dotyka trackera prognoz (save_predictions/evaluate_previous_predictions) —
-trafność prognoz pozostaje funkcją wyłącznie layoutu v1.
+v2 prowadzi sobotni tracker prognoz: rozlicza poprzedni horyzont przed promptem
+Gemini i zapisuje zarówno benchmark techniczny, jak i prognozę wieloczynnikową AI.
 """
 
 import os
+import json
 import time
 import logging
 import queue
@@ -41,7 +42,7 @@ from data_fetching import (
     fetch_quote_cached,
 )
 from report_builder import (
-    format_change, format_pct, market_banner_lines,
+    format_change, format_pct, format_insider_lines, market_banner_lines,
     _v, _fmt_quote_line, _fmt_quotes_block, _fmt_movers, _fmt_portfolio_block,
     _fmt_earnings, generate_trend_analysis_section,
 )
@@ -49,7 +50,9 @@ from technicals import generate_technical_signal, generate_alerts, trend_label
 from snapshot_store import calculate_deltas
 from accuracy_tracker import (
     build_rule_based_predictions, evaluate_previous_predictions,
-    extract_predictions_from_report, format_accuracy_section, save_predictions,
+    extract_predictions_from_report, extract_prediction_reviews,
+    format_accuracy_section, load_accuracy_feedback, record_prediction_reviews,
+    save_predictions,
 )
 
 logger = logging.getLogger(__name__)
@@ -69,6 +72,7 @@ V2_AI_HEADERS = [
 # Sobotnia sekcja AI — format bulletów MUSI pasować do regexa
 # accuracy_tracker.extract_predictions_from_report (TICKER + kierunek=up/down/neutral)
 PREDICTIONS_HEADER = "## Prognozy do weryfikacji"
+PREDICTION_REVIEW_HEADER = "### Analiza trafionych i nietrafionych prognoz"
 
 
 # ============================================================
@@ -92,6 +96,12 @@ def collect_v2_extras(data: dict) -> dict:
         },
         "analyst_recs": {t: fetch_analyst_recommendations(t) for t in data["active_tickers"]},
     }
+    if data.get("is_saturday"):
+        # Ocena musi trafić do prompta, zanim Gemini napisze nowe prognozy.
+        data["prediction_evaluation"] = evaluate_previous_predictions(
+            dry_run=not data.get("persist", True)
+        )
+        data["prediction_feedback"] = load_accuracy_feedback(limit=20)
     return data
 
 
@@ -312,14 +322,7 @@ def _company_data_block(data: dict) -> str:
 
         out.extend(_fmt_analyst_recs(t, (v2.get("analyst_recs") or {}).get(t, {}), q.get("price")))
 
-        ins = fund.get("insider_summary") or {}
-        if ins:
-            ccy = "PLN" if t.endswith(".WA") else "USD"
-            out.append(
-                f"      insiderzy 90d: kupno {(ins.get('buy_value_90d') or 0) / 1e6:.2f} mln {ccy}, "
-                f"sprzedaż {(ins.get('sell_value_90d') or 0) / 1e6:.2f} mln {ccy}, "
-                f"sygnał: {_v(fund.get('insider_signal'))}"
-            )
+        out.extend(format_insider_lines(t, fund))
 
         deltas = calculate_deltas(
             t,
@@ -550,7 +553,7 @@ def _call_gemini_v2(prompt: str, api_key: str) -> str:
 
 def _parse_ai_sections(text: str, headers: Optional[list] = None) -> dict:
     """Dzieli odpowiedź Gemini na sekcje po dokładnych nagłówkach (domyślnie V2_AI_HEADERS;
-    w sobotę lista rozszerzona o PREDICTIONS_HEADER).
+    w sobotę lista rozszerzona o analizę feedbacku i PREDICTIONS_HEADER).
     Brak któregokolwiek nagłówka -> ValueError (uruchamia fallback regułowy)."""
     headers = headers or V2_AI_HEADERS
     positions = []
@@ -565,6 +568,89 @@ def _parse_ai_sections(text: str, headers: Optional[list] = None) -> dict:
         end = positions[i + 1][0] if i + 1 < len(positions) else len(text)
         sections[header] = text[pos:end].strip()
     return sections
+
+
+def _prediction_context(data: dict, ticker: str) -> str:
+    """Kompaktowy zapis informacji dostępnych w chwili tworzenia prognozy."""
+    details = (data.get("portfolio_details") or {}).get(ticker, {}) or {}
+    technicals = details.get("technicals") or {}
+    fundamentals = details.get("fundamentals") or {}
+    insider_summary = fundamentals.get("insider_summary") or {}
+    analyst = ((data.get("v2") or {}).get("analyst_recs") or {}).get(ticker) or {}
+    earnings = (data.get("earnings_dates") or {}).get(ticker) or {}
+    earnings_call = (data.get("earnings_call_context") or {}).get(ticker) or {}
+    news = []
+    for article in ((data.get("news_data") or {}).get(ticker) or [])[:3]:
+        news.append({
+            "date": article.get("date", ""),
+            "title": article.get("title", ""),
+            "url": article.get("url", ""),
+        })
+    context = {
+        "earnings": {
+            "date": earnings.get("date", ""),
+            "days_until": earnings.get("days_until", ""),
+        },
+        "earnings_call": earnings_call,
+        "macro_calendar": [
+            {
+                "date": item.get("date") or item.get("date_range", ""),
+                "event": item.get("event", ""),
+                "impact": item.get("impact", ""),
+            }
+            for item in (data.get("macro_calendar") or [])[:10]
+        ],
+        "news": news,
+        "technicals": {
+            "rsi_14": technicals.get("rsi_14"),
+            "change_5d": technicals.get("change_5d"),
+            "atr_pct": technicals.get("atr_pct"),
+            "volume_ratio_10d": technicals.get("volume_ratio_10d"),
+        },
+        "insiders": {
+            "status": fundamentals.get("insider_data_status", "unavailable"),
+            "buy_value_90d": insider_summary.get("buy_value_90d"),
+            "sell_value_90d": insider_summary.get("sell_value_90d"),
+            "planned_sell_value_90d": insider_summary.get("planned_sell_value_90d"),
+            "discretionary_sell_value_90d": insider_summary.get("discretionary_sell_value_90d"),
+            "planned_buy_value_90d": insider_summary.get("planned_buy_value_90d"),
+            "discretionary_buy_value_90d": insider_summary.get("discretionary_buy_value_90d"),
+            "other_90d": insider_summary.get("recent_other_90d"),
+            "signal": fundamentals.get("insider_signal"),
+            "samples": (fundamentals.get("insider_transactions") or [])[:3],
+        },
+        "analysts": {
+            "summary": analyst.get("rec_summary"),
+            "price_targets": analyst.get("price_targets"),
+            "recent_changes": (analyst.get("recent_changes") or [])[:5],
+        },
+    }
+    return json.dumps(context, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _ensure_saturday_feedback(data: dict) -> tuple[dict, dict]:
+    """Zapewnia jednorazowe rozliczenie także w testach renderera wywołanego wprost."""
+    evaluation = data.get("prediction_evaluation")
+    if evaluation is None:
+        evaluation = evaluate_previous_predictions(dry_run=not data.get("persist", True))
+        data["prediction_evaluation"] = evaluation
+    feedback = data.get("prediction_feedback")
+    if feedback is None:
+        feedback = load_accuracy_feedback(limit=20)
+        data["prediction_feedback"] = feedback
+    return evaluation, feedback
+
+
+def _enrich_predictions(data: dict, predictions: list[dict], source: str) -> list[dict]:
+    """Dodaje ATR i kontekst wejściowy bez zmiany parsowalnego formatu raportu."""
+    for prediction in predictions:
+        ticker = prediction.get("ticker")
+        details = (data.get("portfolio_details") or {}).get(ticker, {}) or {}
+        technicals = details.get("technicals") or {}
+        prediction["source"] = source
+        prediction["atr_pct"] = technicals.get("atr_pct")
+        prediction["forecast_context"] = _prediction_context(data, ticker)
+    return predictions
 
 
 def _build_prompt_v2(data: dict) -> str:
@@ -582,6 +668,12 @@ def _build_prompt_v2(data: dict) -> str:
     is_saturday = data.get("is_saturday", False)
     report_type_note = ""
     saturday_sections = ""
+    feedback = data.get("prediction_feedback") or {"summary": "Brak historii prognoz.", "lessons": []}
+    evaluation = data.get("prediction_evaluation") or {}
+    evaluation_lines = "\n".join(
+        _evaluation_prompt_line(data, item) for item in (evaluation.get("new") or [])
+    ) or "    - brak nowych rozliczeń"
+    lesson_lines = "\n".join(f"    - {lesson}" for lesson in feedback.get("lessons", [])) or "    - brak"
     if is_saturday:
         report_type_note = (
             "\n    Typ raportu: RAPORT SOBOTNI (podsumowanie tygodnia). W nagłówkach sekcji "
@@ -589,13 +681,23 @@ def _build_prompt_v2(data: dict) -> str:
             "technicznych), a ruchy oceniaj w perspektywie całego tygodnia.\n"
         )
         saturday_sections = f"""
+    {PREDICTION_REVIEW_HEADER}
+    Przeanalizuj każdą nowo rozliczoną prognozę Gemini z listy poniżej. Używaj wyłącznie
+    dostarczonych danych i linków. Jeśli nie ma dowodu na katalizator, napisz to wprost.
+    Dla każdej spółki podaj DWA powody: (1) czy teza się sprawdziła i dlaczego,
+    (2) co przeważyło za wzrostem albo spadkiem w tym tygodniu.
+    Każdy wiersz MUSI mieć format:
+    - YYYY-MM-DD TICKER: wynik=trafiona|nietrafiona; wyjaśnienie=...; przeważyło=...; lekcja=...
+
     {PREDICTIONS_HEADER}
-    Dodaj 3-6 krótkich prognoz dla spółek z portfela na horyzont 5 sesji.
-    Format każdej prognozy musi być łatwy do parsowania:
-    - TICKER: kierunek=up/down/neutral; horyzont=5 sesji; teza=jednozdaniowe uzasadnienie oparte na danych.
+    Dodaj prognozę dla KAŻDEJ aktywnej spółki portfela na horyzont 5 sesji.
+    Połącz technikę z newsami, wynikami, rekomendacjami, insiderami, kalendarzem makro
+    i innymi informacjami nadchodzącymi. Nie twórz katalizatora, którego nie ma w danych.
+    Format każdej prognozy MUSI być:
+    - TICKER: kierunek=up/down/neutral; horyzont=5 sesji; pewność=niska|średnia|wysoka; katalizatory=...; ryzyka=...; unieważnienie=...; teza=jednozdaniowa teza.
     """
 
-    n_sections = "siedem" if is_saturday else "sześć"
+    n_sections = "osiem" if is_saturday else "sześć"
     return f"""
     Jesteś starszym analitykiem rynków kapitałowych (NASDAQ i GPW). Piszesz po polsku,
     zwięźle, profesjonalnym językiem finansowym, bez marketingowego entuzjazmu.
@@ -651,6 +753,10 @@ def _build_prompt_v2(data: dict) -> str:
     - Spółki z danymi oznaczonymi [STALE] oznaczaj gwiazdką (*).
     - Ruch przy wolumenie >1.5x średniej opisuj jako potwierdzony; <0.7x jako mało istotny.
     - Wartości 0.00% opisuj neutralnie, bez znaku plus.
+    - Transakcji insiderów NIE opisuj jako "0 USD", gdy w danych jest kwota > 0 albo status b/d/unavailable.
+      "brak zakupów" to nie to samo co zero obrotu — jeśli jest sprzedaż, podaj jej kwotę.
+    - Sprzedaż zaplanowana (10b5-1 / formularz) to słabszy sygnał niż nagła sprzedaż uznaniowa.
+      Grantów i awardów nie nazywaj sprzedażą.
 
     === DANE ===
 
@@ -678,6 +784,14 @@ def _build_prompt_v2(data: dict) -> str:
     SYGNAŁY SENTYMENTU (proxy):
 {_sentiment_data_block(data)}
 
+    HISTORIA TRAFNOŚCI I LEKCJE:
+    Podsumowanie: {feedback.get('summary', 'b/d')}
+    Ostatnie lekcje:
+{lesson_lines}
+
+    NOWE ROZLICZENIA DO ANALIZY:
+{evaluation_lines}
+
     TOP MOVERS USA:
 {_fmt_movers(movers["us_winners"] + movers["us_losers"])}
     TOP MOVERS GPW:
@@ -687,15 +801,47 @@ def _build_prompt_v2(data: dict) -> str:
     """
 
 
-def _saturday_extras_md(data: dict) -> str:
-    """Sobotnie sekcje przeniesione z v1: analiza trendu + trafność prognoz.
+def _week_facts_line(data: dict, ticker: str) -> str:
+    """Fakty z bieżącego raportu: ruch 5 sesji, wolumen, 1-3 newsy."""
+    details = (data.get("portfolio_details") or {}).get(ticker, {}) or {}
+    tech = details.get("technicals") or {}
+    parts = []
+    change = tech.get("change_5d")
+    if change is not None:
+        parts.append(f"zmiana 5 sesji {change:+.2f}%")
+    vol = tech.get("volume_ratio_10d")
+    if vol is not None:
+        parts.append(f"wolumen {vol:.2f}x")
+    news = []
+    for article in ((data.get("news_data") or {}).get(ticker) or [])[:3]:
+        title = article.get("title") or ""
+        url = article.get("url") or ""
+        if title:
+            news.append(f"{title}" + (f" ({url})" if url else ""))
+    if news:
+        parts.append("newsy: " + " | ".join(news))
+    return "; ".join(parts) if parts else "brak jednoznacznego katalizatora w dostępnych informacjach"
 
-    UWAGA: wywoływać RAZ na raport — evaluate_previous_predictions bez dry_run
-    oznacza prognozy jako rozliczone (zapis do CSV)."""
-    md = generate_trend_analysis_section(data["portfolio_details"], data["active_tickers"])
-    md += "\n" + format_accuracy_section(
-        evaluate_previous_predictions(dry_run=not data.get("persist", True))
+
+def _evaluation_prompt_line(data: dict, item: dict) -> str:
+    ticker = item.get("ticker", "b/d")
+    return (
+        f"    - {item.get('prediction_date', 'b/d')} {ticker}: "
+        f"źródło={item.get('source', 'b/d')}, kierunek={item.get('direction', 'b/d')}, "
+        f"cena={item.get('base_price', 'b/d')}→{item.get('horizon_price', 'b/d')}, "
+        f"ruch={item.get('realized_pct', 'b/d')}%, próg_ATR={item.get('threshold_pct', 'b/d')}%, "
+        f"wynik={'trafiona' if item.get('hit') else 'nietrafiona'}; "
+        f"teza={item.get('thesis', '')}; "
+        f"kontekst_z_dnia_prognozy={item.get('forecast_context') or 'b/d'}; "
+        f"tydzień={_week_facts_line(data, ticker)}"
     )
+
+
+def _saturday_extras_md(data: dict) -> str:
+    """Sobotnie sekcje deterministyczne: trend + trafność prognoz."""
+    evaluation, _feedback = _ensure_saturday_feedback(data)
+    md = generate_trend_analysis_section(data["portfolio_details"], data["active_tickers"])
+    md += "\n" + format_accuracy_section(evaluation)
     return md
 
 
@@ -745,6 +891,8 @@ def _assemble_report(data: dict, ai_sections: dict) -> str:
     if data.get("is_saturday"):
         parts.extend([
             _saturday_extras_md(data),
+            ai_sections.get(PREDICTION_REVIEW_HEADER, ""),
+            "",
             ai_sections.get(PREDICTIONS_HEADER, ""),
             "",
             "---",
@@ -760,22 +908,33 @@ def render_ai_report_v2(data: dict, api_key: str) -> str:
     """Renderuje raport v2 przez Gemini. Rzuca wyjątek przy niepowodzeniu
     (report_builder.build_report łapie go i woła render_basic_report_v2)."""
     is_saturday = data.get("is_saturday", False)
-    headers = V2_AI_HEADERS + ([PREDICTIONS_HEADER] if is_saturday else [])
+    headers = V2_AI_HEADERS + ([PREDICTION_REVIEW_HEADER, PREDICTIONS_HEADER] if is_saturday else [])
     prompt = _build_prompt_v2(data)
     response_text = _call_gemini_v2(prompt, api_key)
     ai_sections = _parse_ai_sections(response_text, headers)
+    gemini_predictions = []
+    if is_saturday:
+        gemini_predictions = extract_predictions_from_report(
+            response_text, data["active_tickers"], data["current_prices"]
+        )
+        missing = sorted(set(data["active_tickers"]) - {p.get("ticker") for p in gemini_predictions})
+        if missing:
+            raise ValueError(
+                "Gemini nie wygenerował prognoz dla aktywnych spółek: " + ", ".join(missing)
+            )
     final_report = _assemble_report(data, ai_sections)
 
-    # Zapis prognoz do trackera — tylko w sobotę, nie w podglądzie (port z v1)
+    # Zapis prognoz do trackera — tylko w sobotę, nie w podglądzie.
     if is_saturday and data.get("persist", True):
-        gemini_predictions = extract_predictions_from_report(
-            final_report, data["active_tickers"], data["current_prices"]
-        )
-        # ATR% z dnia prognozy — próg trafności normalizowany zmiennością spółki
-        for pred in gemini_predictions:
-            technicals = (data["portfolio_details"].get(pred.get("ticker"), {}) or {}).get("technicals") or {}
-            pred["atr_pct"] = technicals.get("atr_pct")
-        save_predictions(gemini_predictions or build_rule_based_predictions(data["portfolio_details"]))
+        baseline_details = {
+            ticker: data["portfolio_details"].get(ticker, {})
+            for ticker in data["active_tickers"]
+        }
+        technical_predictions = build_rule_based_predictions(baseline_details)
+        _enrich_predictions(data, technical_predictions, "rule_based_pre_gemini")
+        _enrich_predictions(data, gemini_predictions, "gemini_report")
+        save_predictions(technical_predictions + gemini_predictions)
+        record_prediction_reviews(extract_prediction_reviews(final_report))
     return final_report
 
 
@@ -974,10 +1133,59 @@ def _basic_watchlist(data: dict) -> str:
     return "\n".join(lines)
 
 
+def _basic_prediction_reviews(data: dict) -> str:
+    """Regułowa analiza trafień, gdy Gemini nie napisze recenzji."""
+    evaluation, _feedback = _ensure_saturday_feedback(data)
+    lines = [PREDICTION_REVIEW_HEADER, ""]
+    items = [
+        item for item in (evaluation.get("new") or [])
+        if item.get("source") == "gemini_report"
+    ] or list(evaluation.get("new") or [])
+    if not items:
+        lines.append("*Brak nowo rozliczonych prognoz do analizy.*")
+        lines.append("")
+        return "\n".join(lines)
+
+    for item in items:
+        ticker = item.get("ticker", "b/d")
+        verdict = "trafiona" if item.get("hit") else "nietrafiona"
+        realized = item.get("realized_pct")
+        direction = item.get("direction") or "b/d"
+        if realized is None:
+            explanation = f"teza {direction} vs wynik {verdict}"
+        else:
+            try:
+                realized_txt = f"{float(realized):+.2f}%"
+            except Exception:
+                realized_txt = str(realized)
+            explanation = f"teza {direction} vs ruch {realized_txt} na koniec 5 sesji"
+        driver = _week_facts_line(data, ticker)
+        lesson = (
+            "nie opierać werdyktu wyłącznie na technice, gdy brak katalizatora w newsach"
+            if verdict == "nietrafiona" else
+            "utrzymać wagę katalizatora, który potwierdził się w horyzoncie"
+        )
+        lines.append(
+            f"- {item.get('prediction_date', 'b/d')} {ticker}: wynik={verdict}; "
+            f"wyjaśnienie={explanation}; przeważyło={driver}; lekcja={lesson}"
+        )
+    lines.append("")
+    lines.append("*Sekcja wygenerowana regułowo (fallback bez AI).*")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _basic_predictions(data: dict) -> str:
     """Regułowa sobotnia sekcja prognoz (format parsowalny przez accuracy_tracker)."""
-    predictions = build_rule_based_predictions(data["portfolio_details"])
+    baseline_details = {
+        ticker: data["portfolio_details"].get(ticker, {})
+        for ticker in data.get("active_tickers", data["portfolio_details"].keys())
+    }
+    predictions = build_rule_based_predictions(baseline_details)
+    _enrich_predictions(data, predictions, "rule_based_pre_gemini")
     lines = [PREDICTIONS_HEADER, ""]
+    lines.append("*Fallback techniczny: Gemini nie wygenerował prognozy wieloczynnikowej.*")
+    lines.append("")
     for p in predictions:
         lines.append(
             f"- {p['ticker']}: kierunek={p['direction']}; "
@@ -1003,5 +1211,9 @@ def render_basic_report_v2(data: dict) -> str:
         "## 10. Watchlist": _basic_watchlist(data).rstrip("\n"),
     }
     if data.get("is_saturday"):
+        review_md = _basic_prediction_reviews(data)
         ai_sections[PREDICTIONS_HEADER] = _basic_predictions(data).rstrip("\n")
+        ai_sections[PREDICTION_REVIEW_HEADER] = review_md.rstrip("\n")
+        if data.get("persist", True):
+            record_prediction_reviews(extract_prediction_reviews(review_md))
     return _assemble_report(data, ai_sections)

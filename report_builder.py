@@ -88,6 +88,100 @@ def format_pct(val: Optional[float]) -> str:
     return "0.00%"
 
 
+PLAN_LABELS = {
+    "planned": "zaplanowane 10b5-1",
+    "discretionary": "nagłe",
+    "unknown": "plan: b/d",
+    "other": "",
+}
+
+
+def format_money_amount(value, ccy: str) -> str:
+    """Kwota insiderów: nigdy '0.00 mln' dla braku obrotu lub drobnicy."""
+    if value is None:
+        return "b/d"
+    try:
+        amount = float(value)
+    except Exception:
+        return "b/d"
+    if abs(amount) < 0.5:
+        return "brak"
+    if abs(amount) >= 1e6:
+        return f"{amount / 1e6:.2f} mln {ccy}"
+    if abs(amount) >= 1e3:
+        return f"{amount / 1e3:.1f} tys. {ccy}"
+    return f"{amount:.0f} {ccy}"
+
+
+def _plan_split_text(buy_or_sell: str, ins: dict, ccy: str) -> str:
+    planned = ins.get(f"planned_{buy_or_sell}_value_90d") or 0
+    discretionary = ins.get(f"discretionary_{buy_or_sell}_value_90d") or 0
+    unknown = ins.get(f"unknown_{buy_or_sell}_value_90d") or 0
+    total = ins.get(f"{buy_or_sell}_value_90d") or 0
+    if not total:
+        return ""
+    if planned or discretionary:
+        parts = [
+            f"{format_money_amount(planned, ccy)} zaplanowane",
+            f"{format_money_amount(discretionary, ccy)} nagłe",
+        ]
+        if unknown:
+            parts.append(f"{format_money_amount(unknown, ccy)} b/d")
+        return " (z tego " + " / ".join(parts) + ")"
+    return " (plan: b/d)"
+
+
+def format_insider_lines(ticker: str, fund: dict) -> list[str]:
+    """Linie insiderów do prompta Gemini — bez fałszywego '0 USD'."""
+    ins = fund.get("insider_summary") or {}
+    status = fund.get("insider_data_status", "unavailable")
+    source = fund.get("insider_data_source", "b/d")
+    if status not in ("available", "no_open_market_trades") or not ins:
+        return [
+            f"      insiderzy 90d: b/d — źródło: {source}; "
+            f"status: {status} (to nie jest zero transakcji)"
+        ]
+
+    ccy = "PLN" if ticker.endswith(".WA") else "USD"
+    if status == "no_open_market_trades":
+        return [
+            f"      insiderzy 90d: brak zakupów/sprzedaży rynkowych; "
+            f"inne operacje: {ins.get('recent_other_90d', 0)}; źródło: {source}"
+        ]
+
+    buy_val = ins.get("buy_value_90d") or 0
+    sell_val = ins.get("sell_value_90d") or 0
+    buy_txt = (
+        f"brak zakupów"
+        if not buy_val else
+        f"kupno {format_money_amount(buy_val, ccy)}"
+        f" ({ins.get('recent_buys_90d', 0)} trans.){_plan_split_text('buy', ins, ccy)}"
+    )
+    sell_txt = (
+        f"brak sprzedaży"
+        if not sell_val else
+        f"sprzedaż {format_money_amount(sell_val, ccy)}"
+        f" ({ins.get('recent_sales_90d', 0)} trans.){_plan_split_text('sell', ins, ccy)}"
+    )
+    lines = [
+        f"      insiderzy 90d: {buy_txt}; {sell_txt}; "
+        f"sygnał: {_v(fund.get('insider_signal'))}; źródło: {source}"
+    ]
+    samples = []
+    for item in (fund.get("insider_transactions") or [])[:3]:
+        plan_label = PLAN_LABELS.get(item.get("plan") or "", "")
+        date_txt = item.get("date") or "b/d"
+        extra = f", {plan_label}" if plan_label else ""
+        samples.append(
+            f"{item.get('insider') or 'b/d'}, {item.get('transaction') or 'b/d'}, "
+            f"{item.get('shares') or 0:,} akcji, "
+            f"{format_money_amount(item.get('value'), ccy)} ({date_txt}{extra})"
+        )
+    if samples:
+        lines.append("      przykłady: " + "; ".join(samples))
+    return lines
+
+
 def collect_portfolio_data() -> dict:
     """Pobiera wszystkie dane techniczne, fundamentalne, alpha i notowania dla spółek z portfela."""
     portfolio_details = {}
@@ -331,7 +425,6 @@ def _fmt_portfolio_block(portfolio_details: dict) -> str:
         q = d.get("quote") or {}
         tech = d.get("technicals") or {}
         fund = d.get("fundamentals") or {}
-        ins = fund.get("insider_summary") or {}
 
         out.append(f"    {TICKER_NAMES.get(t, t)} ({t}):")
         out.append(f"      notowanie: {_fmt_quote_line(t, q)}")
@@ -361,17 +454,7 @@ def _fmt_portfolio_block(portfolio_details: dict) -> str:
             f"kapitalizacja {mcap_txt}, {_v(fund.get('pct_from_52w_high'), '%')} od szczytu 52w, "
             f"{_v(fund.get('pct_from_52w_low'), '%')} od dołka 52w, short float {_v(short_pct, '%')}"
         )
-        if ins:
-            val_ccy = "PLN" if t.endswith(".WA") else "USD"
-            buy_val = ins.get("buy_value_90d") or 0
-            sell_val = ins.get("sell_value_90d") or 0
-            out.append(
-                f"      insiderzy 90d: kupno za {buy_val / 1e6:.2f} mln {val_ccy} "
-                f"({ins.get('recent_buys_90d', 0)} transakcji, {ins.get('buy_shares_90d', 0):,} akcji), "
-                f"sprzedaż za {sell_val / 1e6:.2f} mln {val_ccy} "
-                f"({ins.get('recent_sales_90d', 0)}, {ins.get('sell_shares_90d', 0):,} akcji), "
-                f"sygnał: {_v(fund.get('insider_signal'))}"
-            )
+        out.extend(format_insider_lines(t, fund))
         bench = US_BENCHMARK if not t.endswith(".WA") else PL_BENCHMARK
         out.append(f"      alpha 1M vs benchmark sektorowy ({bench}): {_v(d.get('alpha_1m_vs_benchmark'), ' pp')}")
         out.append("")

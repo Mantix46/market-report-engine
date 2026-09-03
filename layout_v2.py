@@ -405,29 +405,42 @@ def _sentiment_data_block(data: dict) -> str:
 # Renderer AI (Gemini) z exponential backoff
 # ============================================================
 
-# Łańcuch modeli zapasowych: gdy podstawowy padnie (503 / wyczerpana dobowa quota),
-# próbujemy kolejnych — każdy ma OSOBNĄ pulę limitów na darmowym tierze.
-# (gemini-3-flash-preview = poprawna nazwa API dla "Gemini 3 Flash"; samo
-# "gemini-3-flash" zwraca 404 NOT_FOUND)
-GEMINI_FALLBACK_CHAIN = ["gemini-3-flash-preview", "gemini-2.5-flash"]
+# Łańcuch modeli zapasowych: gdy podstawowy padnie (503 / 504 / quota),
+# próbujemy kolejnych — każdy ma OSOBNĄ pulę limitów.
+GEMINI_DEFAULT_MODEL = "gemini-3.8-flash"
+GEMINI_FALLBACK_CHAIN = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash"]
 
 # Próby per model: backoff w sekundach (pierwsza natychmiast, druga po 10s).
 GEMINI_MODEL_BACKOFF = [0, 10]
 
-# Łączny budżet czasu dla całej fazy Gemini: 3 minuty.
-# Obejmuje model podstawowy, retry, backoff i modele zapasowe.
-GEMINI_TIMEOUT_SECONDS = 180
+# Łączny budżet czasu dla całej fazy Gemini (retry + zapasowe modele).
+GEMINI_TIMEOUT_SECONDS = 360
+# Twardy limit JEDNEJ próby — nie może zjeść całego budżetu, inaczej
+# łańcuch zapasowy nigdy nie wystartuje (jak 03.09.2026: 504 po 179s).
+GEMINI_ATTEMPT_TIMEOUT_SECONDS = 75
 
 
 def _build_model_chain() -> list[str]:
-    """Podstawowy model (GEMINI_MODEL lub gemini-3.5-flash) + zapasowe,
+    """Podstawowy model (GEMINI_MODEL lub gemini-3.8-flash) + zapasowe,
     zdeduplikowane z zachowaniem kolejności."""
-    primary = os.getenv("GEMINI_MODEL") or "gemini-3.5-flash"
+    primary = os.getenv("GEMINI_MODEL") or GEMINI_DEFAULT_MODEL
     chain = []
     for model in [primary] + GEMINI_FALLBACK_CHAIN:
         if model not in chain:
             chain.append(model)
     return chain
+
+
+def _generate_content_config():
+    """Wyłącza AFC — inaczej SDK woła narzędzia (max 10 remote calls) i request
+    wisi aż do 504 zamiast zwrócić sam tekst raportu."""
+    if genai_types is None:
+        return None
+    afc = getattr(genai_types, "AutomaticFunctionCallingConfig", None)
+    cfg_cls = getattr(genai_types, "GenerateContentConfig", None)
+    if afc is None or cfg_cls is None:
+        return None
+    return cfg_cls(automatic_function_calling=afc(disable=True))
 
 
 def _is_daily_quota_error(err_text: str) -> bool:
@@ -463,10 +476,14 @@ def _generate_content_with_timeout(
                     timeout=timeout_ms,
                 ),
             )
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-            )
+            kwargs = {
+                "model": model_name,
+                "contents": prompt,
+            }
+            config = _generate_content_config()
+            if config is not None:
+                kwargs["config"] = config
+            response = client.models.generate_content(**kwargs)
             result_queue.put((True, response))
         except BaseException as exc:
             result_queue.put((False, exc))
@@ -498,15 +515,19 @@ def _generate_content_with_timeout(
 def _call_gemini_v2(prompt: str, api_key: str) -> str:
     """Wywołanie Gemini z łańcuchem modeli zapasowych.
 
-    Dla każdego modelu (gemini-3.5-flash -> gemini-3-flash -> gemini-2.5-flash)
+    Dla każdego modelu (gemini-3.8-flash -> gemini-3.7-flash -> gemini-3.5-flash)
     do 2 prób z backoffem 0/10s. Wyczerpana DOBOWA quota danego modelu → od razu
-    następny model (czekanie nic nie da). 503/limit per-minute → druga próba,
-    potem następny model. Po wyczerpaniu łańcucha rzuca wyjątek (fallback regułowy
+    następny model (czekanie nic nie da). 503/504/limit per-minute → druga próba,
+    potem następny model. Jedna próba ma własny limit (75s), żeby 504 nie spalił
+    całego budżetu. Po wyczerpaniu łańcucha rzuca wyjątek (fallback regułowy
     przejmuje w report_builder.build_report)."""
     chain = _build_model_chain()
     deadline = time.monotonic() + GEMINI_TIMEOUT_SECONDS
     logger.info(f"Layout v2 — łańcuch modeli Gemini: {' -> '.join(chain)}")
-    logger.info(f"Layout v2 — łączny timeout Gemini: {GEMINI_TIMEOUT_SECONDS}s.")
+    logger.info(
+        f"Layout v2 — łączny timeout Gemini: {GEMINI_TIMEOUT_SECONDS}s "
+        f"(max {GEMINI_ATTEMPT_TIMEOUT_SECONDS}s na próbę)."
+    )
 
     last_error: Optional[Exception] = None
     for model_name in chain:
@@ -529,11 +550,12 @@ def _call_gemini_v2(prompt: str, api_key: str) -> str:
                     f"Layout v2 — [{model_name}] próba {attempt}/{len(GEMINI_MODEL_BACKOFF)} "
                     f"zapytania do Gemini..."
                 )
+                attempt_timeout = min(remaining, float(GEMINI_ATTEMPT_TIMEOUT_SECONDS))
                 response = _generate_content_with_timeout(
                     prompt,
                     api_key,
                     model_name,
-                    remaining,
+                    attempt_timeout,
                 )
                 if not response.text:
                     raise Exception("Pusta odpowiedź z Gemini.")

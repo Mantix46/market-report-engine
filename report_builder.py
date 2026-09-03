@@ -182,16 +182,25 @@ def format_insider_lines(ticker: str, fund: dict) -> list[str]:
     return lines
 
 
-def collect_portfolio_data() -> dict:
-    """Pobiera wszystkie dane techniczne, fundamentalne, alpha i notowania dla spółek z portfela."""
+def collect_portfolio_data(tickers: Optional[list] = None) -> dict:
+    """Pobiera dane techniczne, fundamentalne, alpha i notowania dla wskazanych spółek.
+
+    Bez listy — cały skonfigurowany portfel. Przy święcie przekazuj tylko aktywny rynek.
+    """
+    if tickers is None:
+        tickers = list(US_TICKERS) + list(GPW_TICKERS_MAP.keys())
     portfolio_details = {}
 
-    us_quotes = fetch_quotes_batch(US_TICKERS, period="5d")
-    gpw_quotes = fetch_quotes_batch(list(GPW_TICKERS_MAP.keys()), period="5d")
-    quotes = {**us_quotes, **gpw_quotes}
+    us = [t for t in tickers if not t.endswith(".WA")]
+    gpw = [t for t in tickers if t.endswith(".WA")]
+    quotes = {}
+    if us:
+        quotes.update(fetch_quotes_batch(us, period="5d"))
+    if gpw:
+        quotes.update(fetch_quotes_batch(gpw, period="5d"))
 
-    for t in US_TICKERS + list(GPW_TICKERS_MAP.keys()):
-        benchmark = US_BENCHMARK if t in US_TICKERS else PL_BENCHMARK
+    for t in tickers:
+        benchmark = US_BENCHMARK if not t.endswith(".WA") else PL_BENCHMARK
         quote = quotes.get(t, {})
 
         fundamentals = fetch_fundamentals_short_insider(t)
@@ -202,7 +211,8 @@ def collect_portfolio_data() -> dict:
             "quote": quote,
             "fundamentals": fundamentals,
             "technicals": technicals,
-            "alpha_1m_vs_benchmark": alpha
+            "alpha_1m_vs_benchmark": alpha,
+            "benchmark": benchmark,
         }
     return portfolio_details
 
@@ -234,7 +244,7 @@ def collect_report_data(persist_state: bool = True) -> dict:
 
     # 1. Notowania: portfel (techniczne, fundamenty, alpha), indeksy, makro
     logger.info("Pobieram dane rynkowe (portfel, indeksy, makro)...")
-    portfolio_details = collect_portfolio_data()
+    portfolio_details = collect_portfolio_data(active_tickers)
     index_quotes = {name: fetch_quote_cached(ticker, period="5d") for name, ticker in INDEX_TICKERS.items()}
     macro_quotes = {name: fetch_quote_cached(ticker, period="5d") for name, ticker in MACRO_TICKERS.items()}
     macro_calendar = fetch_macro_calendar(days_ahead=7)
@@ -255,9 +265,18 @@ def collect_report_data(persist_state: bool = True) -> dict:
     # 3. Top movers (tylko otwarte rynki)
     logger.info("Obliczam top movers (NASDAQ-100 i GPW-100)...")
     radar_us = fetch_nasdaq100_tickers() if us_active else []
-    us_winners, us_losers = get_top_movers(radar_us, top_n=3, period="5d") if us_active else ([], [])
-    gpw_winners, gpw_losers = get_top_movers(GPW_100_TICKERS, top_n=3, period="5d") if pl_active else ([], [])
-    sc_winners, sc_losers = get_top_movers(RADAR_SMALLCAPS, top_n=5, period="5d") if us_active else ([], [])
+    us_winners, us_losers = (
+        get_top_movers(radar_us, top_n=3, period="5d", exclude=active_tickers)
+        if us_active else ([], [])
+    )
+    gpw_winners, gpw_losers = (
+        get_top_movers(GPW_100_TICKERS, top_n=3, period="5d", exclude=active_tickers)
+        if pl_active else ([], [])
+    )
+    sc_winners, sc_losers = (
+        get_top_movers(RADAR_SMALLCAPS, top_n=5, period="5d", exclude=active_tickers)
+        if us_active else ([], [])
+    )
     today_movers = {
         "us_winners": us_winners,
         "us_losers": us_losers,
@@ -285,6 +304,7 @@ def collect_report_data(persist_state: bool = True) -> dict:
             top_movers_tickers
         )),
         max_per_ticker=3,
+        max_age_hours=168 if is_saturday else 36,
     )
     logger.info(f"Pobrano newsy dla {len(news_data)} tickerów.")
 
@@ -519,7 +539,7 @@ def generate_trend_analysis_section(portfolio_details: dict, active_tickers: Opt
     lines = []
     lines.append("## Analiza trendu (tygodniowa)")
     lines.append("")
-    lines.append("| Spolka | Uklad srednich | ADX (+DI/-DI) | Supertrend | Ichimoku | Donchian | ATR % | Nachylenie |")
+    lines.append("| Spółka | Układ średnich | ADX (+DI/-DI) | Supertrend | Ichimoku | Donchian | ATR % | Nachylenie |")
     lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
     for ticker in tickers:
         t = (portfolio_details.get(ticker, {}) or {}).get("technicals") or {}

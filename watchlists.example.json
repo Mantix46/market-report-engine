@@ -6,6 +6,14 @@
   "GPW_NEWS_QUERIES": {
     "PKO.WA": "PKO BP akcje"
   },
+  "TICKER_NAMES": {
+    "AAPL": "Apple",
+    "MSFT": "Microsoft",
+    "PKO.WA": "PKO BP"
+  },
   "TICKER_NOTES": {},
+  "RADAR_NOTES": {
+    "PLTR": "przykład: krótki kontekst dla radaru, opcjonalny"
+  },
   "RADAR_SMALLCAPS": ["SOFI", "PLTR", "IONQ"]
 }

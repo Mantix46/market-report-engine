@@ -145,3 +145,22 @@ def test_format_accuracy_section_includes_reason():
     assert "nietrafiona" in md
     assert "teza wzrostowa, a kurs spadł" in md
     assert "słabe wyniki" in md
+    assert "Trafność prognoz tygodniowych" in md
+
+
+def test_format_accuracy_section_splits_atr_and_legacy_cohorts():
+    md = accuracy_tracker.format_accuracy_section({
+        "new": [],
+        "total_evaluated": 10,
+        "total_hits": 4,
+        "pending": 0,
+        "stats": {"source": {"gemini_report": {"hits": 3, "total": 6}}},
+        "atr_evaluated": 6,
+        "atr_hits": 3,
+        "legacy_evaluated": 4,
+        "legacy_hits": 1,
+    })
+    assert "Skuteczność łącznie" in md
+    assert "próg 0,5×ATR: 3/6" in md
+    assert "stary próg stały" in md
+    assert "gemini_report: 3/6" in md

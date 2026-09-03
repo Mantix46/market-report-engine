@@ -68,9 +68,12 @@ RADAR_SMALLCAPS = ["SOFI", "PLTR", "IONQ"]
 
 # Noty ostrzegawcze per ticker (nadpisywane przez watchlists.json -> TICKER_NOTES)
 TICKER_NOTES = {}
+# Krótki kontekst dla radaru small-cap (watchlists.json -> RADAR_NOTES)
+RADAR_NOTES = {}
 
 # Wczytywanie z watchlists.json
 watchlist_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchlists.json")
+_watchlist_names = {}
 if os.path.exists(watchlist_path):
     try:
         with open(watchlist_path, "r", encoding="utf-8") as f:
@@ -80,6 +83,8 @@ if os.path.exists(watchlist_path):
             GPW_NEWS_QUERIES = config_data.get("GPW_NEWS_QUERIES", GPW_NEWS_QUERIES)
             RADAR_SMALLCAPS = config_data.get("RADAR_SMALLCAPS", RADAR_SMALLCAPS)
             TICKER_NOTES = config_data.get("TICKER_NOTES", TICKER_NOTES)
+            RADAR_NOTES = config_data.get("RADAR_NOTES", RADAR_NOTES)
+            _watchlist_names = config_data.get("TICKER_NAMES", {}) or {}
     except Exception as e:
         logger.warning(f"Błąd wczytywania watchlists.json: {e}. Używam wbudowanej konfiguracji.")
 
@@ -115,11 +120,15 @@ TICKER_NAMES = {
 for t, name in GPW_TICKERS_MAP.items():
     if t not in TICKER_NAMES:
         TICKER_NAMES[t] = name
+for t, name in _watchlist_names.items():
+    if name:
+        TICKER_NAMES[t] = name
 
 MACRO_TICKERS = {
     "VIX": "^VIX",
     "US 10Y Treasury": "^TNX",
     "USD/PLN": "USDPLN=X",
+    "DXY": "DX-Y.NYB",
 }
 
 # ============================================================
@@ -183,18 +192,24 @@ def fetch_quote(ticker: str, period: str = "5d") -> dict:
             prev_close = None
         
         volume = hist["Volume"].iloc[-1] if "Volume" in hist.columns else 0
-        
+        volume_ratio = None
+        if "Volume" in hist.columns and len(hist) >= 3:
+            avg_vol = hist["Volume"].iloc[:-1].mean()
+            if avg_vol and not pd.isna(avg_vol) and avg_vol > 0:
+                volume_ratio = round(float(volume) / float(avg_vol), 2)
+
         latest_date = hist.index[-1].date()
         today = warsaw_today()
         # Liczymy dni ROBOCZE, nie kalendarzowe — piątkowe dane w poniedziałek nie są "stale"
         is_stale = int(np.busday_count(latest_date, today)) > 2
-        
+
         return {
             "symbol": ticker,
             "price": round(latest_close, 2),
             "change_pct": round(change_pct, 2),
             "prev_close": round(prev_close, 2) if prev_close is not None else None,
-            "volume": int(volume),
+            "volume": int(volume) if volume == volume else 0,
+            "volume_ratio": volume_ratio,
             "error": False,
             "data_date": str(latest_date),
             "is_stale": is_stale,
@@ -297,6 +312,7 @@ def get_index_tickers_v2() -> dict:
     return {
         "S&P 500": "^GSPC",
         "NASDAQ 100": "^NDX",
+        "SMH (semis)": "SMH",
         "Euro Stoxx 50": "^STOXX50E",
         label: wig,
     }
@@ -318,16 +334,33 @@ def fetch_period_change(ticker: str, period: str = "7d") -> Optional[float]:
     return None
 
 
-def get_top_movers(tickers: list[str], top_n: int = 3, period: str = "5d") -> tuple[list, list]:
-    """Zwraca top N zyskujących i tracących."""
+def get_top_movers(
+    tickers: list[str],
+    top_n: int = 3,
+    period: str = "5d",
+    exclude: Optional[list[str]] = None,
+    min_volume_ratio: float = 0.7,
+) -> tuple[list, list]:
+    """Zwraca top N zyskujących i tracących.
+
+    Pomija tickery z `exclude` (np. portfel) oraz ruchy przy wolumenie
+    poniżej `min_volume_ratio` średniej z dostępnej historii. Brak ratio
+    nie dyskwalifikuje spółki.
+    """
+    exclude_set = set(exclude or [])
     quotes = fetch_quotes_batch(tickers, period)
-    valid = [(k, v) for k, v in quotes.items() if not v.get("error")]
-    
+    valid = []
+    for k, v in quotes.items():
+        if v.get("error") or k in exclude_set:
+            continue
+        ratio = v.get("volume_ratio")
+        if ratio is not None and ratio < min_volume_ratio:
+            continue
+        valid.append((k, v))
+
     sorted_by_change = sorted(valid, key=lambda x: x[1].get("change_pct", 0))
-    
     losers = sorted_by_change[:top_n]
     winners = sorted_by_change[-top_n:][::-1]
-    
     return winners, losers
 
 

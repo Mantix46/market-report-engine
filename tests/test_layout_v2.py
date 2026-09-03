@@ -2,7 +2,6 @@
 
 import os
 import sys
-import threading
 from datetime import datetime
 
 import pytest
@@ -30,12 +29,19 @@ def sample_data():
                 "technicals": {"rsi_14": 55.0, "price_vs_sma20": 1.0, "price_vs_sma50": 2.0,
                                "macd_trend": "bullish", "bollinger_signal": "neutral",
                                "volume_ratio_10d": 1.8, "macd_histogram": 0.5,
-                               "bollinger_position": 0.6},
+                               "bollinger_position": 0.6, "change_5d": 3.2, "atr_pct": 4.1},
                 "fundamentals": {"forward_pe": 12.5, "trailing_pe": None, "ev_to_ebitda": 8.1,
                                  "peg_ratio": 1.2, "price_to_book": 3.3, "fcf_yield_pct": 4.56,
                                  "return_on_equity": 0.23, "debt_to_ebitda": 0.8,
                                  "operating_margin": 0.31, "short_pct_float": 0.15,
-                                 "insider_signal": "neutral", "insider_summary": {}},
+                                 "pct_from_52w_high": -12.4,
+                                 "insider_signal": "neutral", "insider_data_status": "available",
+                                 "insider_summary": {"sell_value_90d": 10_000_000,
+                                                     "planned_sell_value_90d": 10_000_000,
+                                                     "discretionary_sell_value_90d": 0,
+                                                     "buy_value_90d": 0}},
+                "alpha_1m_vs_benchmark": 1.5,
+                "benchmark": "SMH",
             },
             "XTB.WA": {
                 "quote": {**quote, "price": 70.0, "change_pct": -2.5},
@@ -55,11 +61,11 @@ def sample_data():
         ],
         "earnings_dates": {"MU": {"date": "2026-07-12", "days_until": 4, "is_range": False}},
         "today_movers": {
-            "us_winners": [("NVDA", {"price": 200.0, "change_pct": 5.0})],
-            "us_losers": [("INTC", {"price": 30.0, "change_pct": -4.0})],
-            "gpw_winners": [("KGH.WA", {"price": 150.0, "change_pct": 3.0})],
+            "us_winners": [("NVDA", {"price": 200.0, "change_pct": 5.0, "volume_ratio": 1.9})],
+            "us_losers": [("INTC", {"price": 30.0, "change_pct": -4.0, "volume_ratio": 1.2})],
+            "gpw_winners": [("KGH.WA", {"price": 150.0, "change_pct": 3.0, "volume_ratio": 2.1})],
             "gpw_losers": [],
-            "sc_winners": [("AIXA.DE", {"price": 25.0, "change_pct": 6.0})],
+            "sc_winners": [("AIXA.DE", {"price": 25.0, "change_pct": 6.0, "volume_ratio": 1.4})],
             "sc_losers": [],
         },
         "news_data": {"MU": [{"publisher": "Reuters", "title": "Micron beats estimates",
@@ -140,18 +146,43 @@ def test_movers_section(sample_data):
     assert "### USA -- Top movers" in md
     assert "### GPW -- Top movers" in md
     assert "### Sektor AI Bottlenecks (Small/Mid-Caps) -- Top movers" in md
-    assert "| Spółka | Kurs | Zmiana |" in md
+    assert "**Wzrosty**" in md and "**Spadki**" in md
+    assert "| Spółka | Kurs | Zmiana | Wolumen |" in md
     assert "$200.00" in md and "+5.00%" in md
+    assert "1.90x" in md
     assert "150.00 PLN" in md
     assert "| 25.00 |" in md  # ticker EU bez znaku $
+    assert "MU" not in md  # portfel nie trafia na radar w testdata movers
 
 
 def test_valuation_table(sample_data):
     md = layout_v2.build_valuation_md(sample_data)
     assert "## 8. Wycena i technika" in md
-    assert "| **MU** | 12.50 | b/d | 8.10 | 1.20 | 3.30 | 4.6% | 23.0% | 0.80 | 31.0% |" in md
-    # spółka bez fundamentów -> b/d wszędzie, bez wyjątku
+    assert "| **MU** | 12.50 | 8.10 | 4.6% | -12.4% |" in md
+    assert "Trailing P/E" not in md
     assert "| **XTB.WA** | b/d |" in md
+    sample_data["is_saturday"] = True
+    sat = layout_v2.build_valuation_md(sample_data)
+    assert "### Wycena — szczegóły" in sat
+    assert "Trailing P/E" in sat
+    assert "23.0%" in sat
+
+
+def test_positions_table(sample_data):
+    md = layout_v2.build_positions_md(sample_data)
+    assert md.startswith("## Moje pozycje")
+    assert "MU" in md and "XTB.WA" in md
+    assert "+1.5 pp vs SMH" in md
+    assert "1.80x" in md
+    assert "2026-07-12" in md
+    assert "insider: sprzedaż zaplanowana" in md
+    assert "52w -12.4%" in md
+
+
+def test_macro_includes_portfolio_earnings(sample_data):
+    md = layout_v2.build_macro_md(sample_data)
+    assert "**Wyniki spółek portfela:**" in md
+    assert "MU" in md and "2026-07-12" in md
 
 
 def test_parse_ai_sections_roundtrip():
@@ -173,10 +204,16 @@ def test_basic_report_has_all_ten_sections(sample_data):
         assert f"## {i}." in md, f"Brak sekcji {i} w raporcie regułowym"
     assert md.startswith("# RAPORT RYNKOWY -- ")
     assert "Disclaimer" in md
-    # ocena wpływu w monitoringu spółek
+    assert "## Moje pozycje" in md
+    assert md.find("## Moje pozycje") < md.find("## 1. Executive Summary")
     assert "**Wpływ: " in md
     assert "Top 5 wydarzeń makro" in md
     assert "Radar rynkowy" in md
+    assert "Źródło analizy: fallback regułowy" in md
+    assert "NVDA" in md  # watchlist spoza portfela
+    # watchlist nie recytuje spółek portfela jako jedynej treści
+    watch = md.split("## 10. Watchlist", 1)[1]
+    assert "**MU**" not in watch.split("##")[0]
 
 
 def test_parse_ai_sections_extended_headers():
@@ -242,6 +279,9 @@ def test_saturday_prompt_contains_feedback_and_upcoming_events(sample_data):
     assert "CPI (inflacja US)" in prompt  # nadchodzące makro
     assert "KAŻDEJ aktywnej spółki" in prompt
     assert "MU" in prompt and "XTB.WA" in prompt
+    assert "PEŁNA TECHNIKA I FUNDAMENTY PORTFELA" not in prompt
+    assert "TYLKO spółki SPOZA portfela" in prompt
+    assert "ATR% > 5" in prompt
 
 
 def test_saturday_basic_report_persist_saves(sample_data, monkeypatch):
@@ -362,151 +402,19 @@ def test_basic_company_impact_rules():
         {"change_pct": 0.5}, {"volume_ratio_10d": 1.0}) == "neutralny"
 
 
-# ---- Łańcuch modeli Gemini (_call_gemini_v2) ----
-
-_DAILY_QUOTA_MSG = (
-    "429 RESOURCE_EXHAUSTED. Quota exceeded for metric "
-    "GenerateRequestsPerDayPerProjectPerModel-FreeTier, limit: 20"
-)
-_OVERLOAD_MSG = "503 UNAVAILABLE. This model is currently experiencing high demand."
-
-
-class _FakeModels:
-    def __init__(self, script, calls):
-        self.script = script  # {model_name: [str|Exception, ...]} kolejno per wywołanie
-        self.calls = calls
-
-    def generate_content(self, model, contents, **kwargs):
-        self.calls.append(model)
-        outcomes = self.script.get(model, [])
-        idx = sum(1 for c in self.calls if c == model) - 1
-        outcome = outcomes[idx] if idx < len(outcomes) else Exception(_OVERLOAD_MSG)
-        if isinstance(outcome, Exception):
-            raise outcome
-        return type("R", (), {"text": outcome})()
-
-
-class _FakeGenai:
-    def __init__(self, script, calls):
-        self._script, self._calls = script, calls
-        self.http_options = None
-
-    def Client(self, api_key, http_options=None):
-        self.http_options = http_options
-        models = _FakeModels(self._script, self._calls)
-        return type("C", (), {"models": models})()
-
-
-@pytest.fixture
-def gemini_env(monkeypatch):
-    """Fabryka fake-genai + zerowy sleep; zwraca (install_script, calls, sleeps)."""
-    calls, sleeps = [], []
-    monkeypatch.setattr(layout_v2.time, "sleep", lambda s: sleeps.append(s))
-    monkeypatch.delenv("GEMINI_MODEL", raising=False)
-
-    def install(script):
-        monkeypatch.setattr(layout_v2, "genai", _FakeGenai(script, calls))
-        return calls, sleeps
-    return install
-
-
-def test_gemini_chain_falls_through_on_503(gemini_env):
-    calls, sleeps = gemini_env({
-        "gemini-3.8-flash": [Exception(_OVERLOAD_MSG), Exception(_OVERLOAD_MSG)],
-        "gemini-3.7-flash": ["RAPORT Z 3.7"],
-    })
-    result = layout_v2._call_gemini_v2("prompt", "key")
-    assert result == "RAPORT Z 3.7"
-    assert calls == ["gemini-3.8-flash", "gemini-3.8-flash", "gemini-3.7-flash"]
-    assert 10 in sleeps  # backoff między próbami modelu podstawowego
-
-
-def test_gemini_attempt_timeout_is_capped(gemini_env):
-    gemini_env({"gemini-3.8-flash": ["RAPORT"]})
-
-    layout_v2._call_gemini_v2("prompt", "key")
-
-    assert layout_v2.genai.http_options.timeout <= layout_v2.GEMINI_ATTEMPT_TIMEOUT_SECONDS * 1000
-    assert layout_v2.genai.http_options.timeout >= 1
-
-
-def test_gemini_hard_timeout_returns_control(monkeypatch):
-    release_request = threading.Event()
-
-    class BlockingModels:
-        def generate_content(self, model, contents, **kwargs):
-            release_request.wait()
-            return type("R", (), {"text": "ZA PÓŹNO"})()
-
-    class BlockingGenai:
-        def Client(self, api_key, http_options=None):
-            return type("C", (), {"models": BlockingModels()})()
-
-    monkeypatch.setattr(layout_v2, "genai", BlockingGenai())
-    try:
-        with pytest.raises(TimeoutError, match="Przekroczono .*limit"):
-            layout_v2._generate_content_with_timeout(
-                "prompt",
-                "key",
-                "model",
-                timeout_seconds=0.01,
-            )
-    finally:
-        release_request.set()
-
-
-def test_gemini_chain_skips_daily_quota_fast(gemini_env):
-    calls, sleeps = gemini_env({
-        "gemini-3.8-flash": [Exception(_DAILY_QUOTA_MSG)],
-        "gemini-3.7-flash": [Exception(_DAILY_QUOTA_MSG)],
-        "gemini-3.5-flash": ["RAPORT Z 3.5"],
-    })
-    result = layout_v2._call_gemini_v2("prompt", "key")
-    assert result == "RAPORT Z 3.5"
-    assert calls == ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash"]
-    assert sleeps == []
-
-
-def test_gemini_504_retries_then_fallback(gemini_env):
-    deadline = Exception("504 DEADLINE_EXCEEDED. Deadline expired before operation could complete.")
-    calls, sleeps = gemini_env({
-        "gemini-3.8-flash": [deadline, deadline],
-        "gemini-3.7-flash": ["RAPORT Z 3.7"],
-    })
-    result = layout_v2._call_gemini_v2("prompt", "key")
-    assert result == "RAPORT Z 3.7"
-    assert calls == ["gemini-3.8-flash", "gemini-3.8-flash", "gemini-3.7-flash"]
-    assert 10 in sleeps
-
-
-def test_gemini_chain_all_fail_raises(gemini_env):
-    gemini_env({
-        "gemini-3.8-flash": [Exception(_OVERLOAD_MSG), Exception(_OVERLOAD_MSG)],
-        "gemini-3.7-flash": [Exception(_OVERLOAD_MSG), Exception(_OVERLOAD_MSG)],
-        "gemini-3.5-flash": [Exception(_OVERLOAD_MSG), Exception(_OVERLOAD_MSG)],
-    })
-    with pytest.raises(Exception):
-        layout_v2._call_gemini_v2("prompt", "key")
-
-
-def test_build_model_chain_dedup_with_env(monkeypatch):
-    monkeypatch.setenv("GEMINI_MODEL", "gemini-3.7-flash")
-    assert layout_v2._build_model_chain() == [
-        "gemini-3.7-flash", "gemini-3.8-flash", "gemini-3.5-flash",
-    ]
-
-
-def test_build_model_chain_default(monkeypatch):
-    monkeypatch.delenv("GEMINI_MODEL", raising=False)
-    assert layout_v2._build_model_chain() == [
-        "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash",
-    ]
-
-
-def test_is_daily_quota_error():
-    assert layout_v2._is_daily_quota_error(_DAILY_QUOTA_MSG)
-    assert layout_v2._is_daily_quota_error("429 ... limit: 0, model: x")
-    assert not layout_v2._is_daily_quota_error(_OVERLOAD_MSG)
-    # per-minute 429 (bez PerDay) NIE jest dobową quotą — zasługuje na retry
-    assert not layout_v2._is_daily_quota_error(
-        "429 RESOURCE_EXHAUSTED limit: 20 PerMinute")
+def test_humanize_predictions_keeps_parser_lines(sample_data, monkeypatch):
+    sample_data["is_saturday"] = True
+    sample_data["persist"] = False
+    monkeypatch.setattr(layout_v2, "evaluate_previous_predictions", lambda dry_run: {})
+    monkeypatch.setattr(layout_v2, "format_accuracy_section", lambda result: "*mock*")
+    monkeypatch.setattr(
+        layout_v2, "build_rule_based_predictions",
+        lambda details: [{"ticker": "MU", "direction": "up", "horizon_days": 5,
+                          "thesis": "RSI 55 przy trendzie wzrostowym"}],
+    )
+    md = layout_v2.render_basic_report_v2(sample_data)
+    assert "| Spółka | Kierunek | Pewność | Teza |" in md
+    assert "| **MU** | wzrost |" in md
+    from accuracy_tracker import extract_predictions_from_report
+    parsed = extract_predictions_from_report(md, ["MU"], {"MU": 100.0})
+    assert parsed and parsed[0]["direction"] == "up"

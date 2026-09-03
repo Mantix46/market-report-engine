@@ -439,6 +439,8 @@ def evaluate_previous_predictions(dry_run: bool = False) -> dict:
     evaluated_rows = [r for r in rows if r.get("evaluated_date")]
     total_hits = sum(1 for r in evaluated_rows if str(r.get("hit")) in ("1", "True", "true"))
     stats = _calculate_accuracy_stats(evaluated_rows)
+    atr_rows = [r for r in evaluated_rows if _parse_float(r.get("atr_pct"))]
+    legacy_rows = [r for r in evaluated_rows if not _parse_float(r.get("atr_pct"))]
     if changed and not dry_run:
         logger.info(f"Rozliczono {len(new_evaluations)} prognoz (lacznie: {total_hits}/{len(evaluated_rows)}).")
     return {
@@ -447,6 +449,10 @@ def evaluate_previous_predictions(dry_run: bool = False) -> dict:
         "total_evaluated": len(evaluated_rows),
         "pending": pending,
         "stats": stats,
+        "atr_evaluated": len(atr_rows),
+        "atr_hits": sum(1 for r in atr_rows if str(r.get("hit")) in ("1", "True", "true")),
+        "legacy_evaluated": len(legacy_rows),
+        "legacy_hits": sum(1 for r in legacy_rows if str(r.get("hit")) in ("1", "True", "true")),
     }
 
 
@@ -560,7 +566,7 @@ def record_prediction_reviews(reviews: list[dict]) -> int:
 
 
 def format_accuracy_section(result: dict) -> str:
-    lines = ["### Trafnosc prognoz tygodniowych", ""]
+    lines = ["### Trafność prognoz tygodniowych", ""]
     result = result or {}
     new_items = result.get("new") or []
     total_evaluated = result.get("total_evaluated", 0)
@@ -568,7 +574,7 @@ def format_accuracy_section(result: dict) -> str:
     pending = result.get("pending", 0)
 
     if not total_evaluated and not new_items and not pending:
-        lines.append("*Brak dojrzalych prognoz do rozliczenia w tym raporcie.*")
+        lines.append("*Brak dojrzałych prognoz do rozliczenia w tym raporcie.*")
         lines.append("")
         return "\n".join(lines)
 
@@ -602,12 +608,12 @@ def format_accuracy_section(result: dict) -> str:
         lines.append("")
 
     if pending:
-        lines.append(f"*{pending} prognoz oczekuje jeszcze na zamkniecie horyzontu (np. po dniach swiatecznych).*")
+        lines.append(f"*{pending} prognoz oczekuje jeszcze na zamknięcie horyzontu (np. po dniach świątecznych).*")
         lines.append("")
 
     if total_evaluated:
         pct = total_hits / total_evaluated * 100
-        lines.append(f"Skutecznosc lacznie (prognozy sobotnie): **{total_hits}/{total_evaluated}** ({pct:.0f}%).")
+        lines.append(f"Skuteczność łącznie (prognozy sobotnie): **{total_hits}/{total_evaluated}** ({pct:.0f}%).")
         lines.append("")
         stats = result.get("stats") or {}
         if stats.get("source"):
@@ -616,5 +622,21 @@ def format_accuracy_section(result: dict) -> str:
                 source_pct = item["hits"] / item["total"] * 100 if item["total"] else 0
                 sample_note = " — mała próba" if item["total"] < 20 else ""
                 lines.append(f"- {source}: {item['hits']}/{item['total']} ({source_pct:.0f}%){sample_note}")
+            lines.append("")
+        atr_n = result.get("atr_evaluated", 0)
+        legacy_n = result.get("legacy_evaluated", 0)
+        if atr_n or legacy_n:
+            lines.append("**Kohorty progu:**")
+            if atr_n:
+                atr_hits = result.get("atr_hits", 0)
+                atr_pct = atr_hits / atr_n * 100
+                lines.append(f"- próg 0,5×ATR: {atr_hits}/{atr_n} ({atr_pct:.0f}%)")
+            if legacy_n:
+                legacy_hits = result.get("legacy_hits", 0)
+                legacy_pct = legacy_hits / legacy_n * 100
+                lines.append(
+                    f"- stary próg stały 1%/2% (bez ATR): {legacy_hits}/{legacy_n} "
+                    f"({legacy_pct:.0f}%) — nie mieszać z kohortą ATR"
+                )
             lines.append("")
     return "\n".join(lines)

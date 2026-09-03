@@ -62,6 +62,15 @@ EMAIL_CSS = """
         margin: 16px 0;
         font-size: 13px;
     }
+    .table-wrap {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        margin: 16px 0;
+    }
+    .table-wrap table {
+        margin: 0;
+        min-width: 520px;
+    }
     th {
         background-color: #161b22;
         color: #58a6ff;
@@ -130,6 +139,15 @@ EMAIL_CSS = """
 
 import re
 
+def wrap_tables(html: str) -> str:
+    """Owija tabele w kontener z poziomym scrollem (Gmail / telefon)."""
+    return re.sub(
+        r"<table>",
+        '<div class="table-wrap"><table>',
+        html,
+    ).replace("</table>", "</table></div>")
+
+
 def colorize_percentages(html: str) -> str:
     """Koloruje wartości procentowe: zielone dla +, czerwone dla -.
     Wartości ±0.00% zostają bez koloru (ruch neutralny)."""
@@ -155,9 +173,10 @@ def markdown_to_html(md_content: str) -> str:
         md_content,
         extensions=["tables", "fenced_code", "nl2br"],
     )
-    
+
     # Kolorowanie zmian procentowych
     html_body = colorize_percentages(html_body)
+    html_body = wrap_tables(html_body)
     
     # Pełny HTML document
     html = f"""<!DOCTYPE html>

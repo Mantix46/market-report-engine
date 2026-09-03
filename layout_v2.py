@@ -1,52 +1,36 @@
-"""Layout v2 raportu rynkowego — alternatywny, 10-sekcyjny układ (flaga --layout v2).
+"""Layout v2 raportu rynkowego — 10-sekcyjny układ.
 
 Konsumuje ten sam słownik ReportData z report_builder.collect_report_data();
-sekcje deterministyczne (2, 3, 5, 6, 8) buduje w Pythonie, sekcje narracyjne
-(1, 4, 7, 9, 10) generuje Gemini z fallbackiem regułowym.
+sekcje deterministyczne buduje w Pythonie, narracyjne Gemini z fallbackiem regułowym.
 
-Struktura (celowo INNA niż v1 — patrz skill report-style, sekcja "Layout v2"):
- 1. Executive Summary          (AI)
- 2. Benchmarki rynkowe         (tabela: 1D / 1T / YTD)
- 3. Makroekonomia              (wskaźniki + kalendarz z emoji 🔴🟠🟢)
- 4. Monitoring spółek          (AI: newsy + wpływ na tezę + ocena wpływu)
- 5. Top 5 wydarzeń makro       (AI: newsy makro z linkami + kalendarz, jak w v1)
- 6. Radar rynkowy              (tabele top movers w układzie v1: USA/GPW/AI Bottlenecks)
- 7. Ryzyka                     (AI)
- 8. Wycena i technika          (tabela wskaźników wyceny + sygnał techniczny)
- 9. Sentyment                  (AI, proxy: VIX/short/insider/wolumen/rekomendacje)
-10. Watchlist                  (AI)
-
-v2 prowadzi sobotni tracker prognoz: rozlicza poprzedni horyzont przed promptem
-Gemini i zapisuje zarówno benchmark techniczny, jak i prognozę wieloczynnikową AI.
+Klient HTTP Gemini: gemini_client.py.
 """
 
-import os
 import json
-import time
 import logging
-import queue
-import threading
+import re
 from datetime import datetime, timedelta
 from typing import Optional
 
-try:
-    from google import genai
-    from google.genai import types as genai_types
-except ImportError:
-    genai = None
-    genai_types = None
-
 from data_fetching import (
-    US_TICKERS, GPW_TICKERS_MAP, TICKER_NAMES, TICKER_NOTES,
+    US_TICKERS, GPW_TICKERS_MAP, TICKER_NAMES, TICKER_NOTES, RADAR_NOTES,
+    US_BENCHMARK, PL_BENCHMARK,
     get_index_tickers_v2, fetch_period_change, fetch_analyst_recommendations,
     fetch_quote_cached,
 )
+from gemini_client import (
+    GEMINI_ATTEMPT_TIMEOUT_SECONDS,
+    GEMINI_FALLBACK_CHAIN,
+    GEMINI_TIMEOUT_SECONDS,
+    call_gemini,
+)
 from report_builder import (
-    format_change, format_pct, format_insider_lines, market_banner_lines,
-    _v, _fmt_quote_line, _fmt_quotes_block, _fmt_movers, _fmt_portfolio_block,
+    format_change, format_pct, format_insider_lines,
+    market_banner_lines,
+    _v, _fmt_quote_line, _fmt_quotes_block, _fmt_movers,
     _fmt_earnings, generate_trend_analysis_section,
 )
-from technicals import generate_technical_signal, generate_alerts, trend_label
+from technicals import generate_technical_signal, trend_label
 from snapshot_store import calculate_deltas
 from accuracy_tracker import (
     build_rule_based_predictions, evaluate_previous_predictions,
@@ -125,6 +109,95 @@ def _header_v2(now: datetime, skip: set, status: dict) -> str:
     return header
 
 
+def _insider_flag(fund: dict) -> str:
+    status = fund.get("insider_data_status", "unavailable")
+    if status not in ("available", "no_open_market_trades"):
+        return "insider: b/d"
+    ins = fund.get("insider_summary") or {}
+    planned_s = ins.get("planned_sell_value_90d") or 0
+    disc_s = ins.get("discretionary_sell_value_90d") or 0
+    planned_b = ins.get("planned_buy_value_90d") or 0
+    disc_b = ins.get("discretionary_buy_value_90d") or 0
+    sell = ins.get("sell_value_90d") or 0
+    buy = ins.get("buy_value_90d") or 0
+    if disc_s and disc_s >= planned_s and disc_s >= max(buy, disc_b):
+        return "insider: sprzedaż nagła"
+    if planned_s and planned_s >= disc_s and sell:
+        return "insider: sprzedaż zaplanowana"
+    if disc_b or planned_b or buy:
+        return "insider: kupno"
+    if status == "no_open_market_trades":
+        return "insider: brak obrotu"
+    return "insider: plan b/d" if sell or buy else "insider: brak"
+
+
+def _short_pct_display(fund: dict) -> Optional[float]:
+    short_pct = fund.get("short_pct_float")
+    if short_pct is None:
+        return None
+    if short_pct <= 1.0:
+        short_pct = round(short_pct * 100.0, 1)
+    return short_pct
+
+
+def build_positions_md(data: dict) -> str:
+    """Tabela portfela — skan w 20 sekund przed Executive Summary."""
+    lines = ["## Moje pozycje", ""]
+    lines.append(
+        "| Spółka | Kurs | 1D | 5 sesji | vs bench. | Wol. | Tech | Wyniki | Flagi |"
+    )
+    lines.append("| :--- | ---: | ---: | ---: | ---: | ---: | :--- | :--- | :--- |")
+    for ticker in data.get("active_tickers") or []:
+        details = data["portfolio_details"].get(ticker, {}) or {}
+        q = details.get("quote") or {}
+        tech = details.get("technicals") or {}
+        fund = details.get("fundamentals") or {}
+        name = TICKER_NAMES.get(ticker, ticker)
+        ccy = "PLN" if ticker.endswith(".WA") else "USD"
+        if q.get("error") or q.get("price") is None:
+            lines.append(
+                f"| **{name}** ({ticker}) | b/d | b/d | b/d | b/d | b/d | b/d | b/d | b/d |"
+            )
+            continue
+        price = f"{q['price']:.2f} {ccy}"
+        change_1d = format_change(q.get("change_pct")) if q.get("change_pct") is not None else "b/d"
+        change_5d = tech.get("change_5d")
+        change_5d_txt = format_change(change_5d) if change_5d is not None else "b/d"
+        bench = details.get("benchmark") or (PL_BENCHMARK if ticker.endswith(".WA") else US_BENCHMARK)
+        alpha = details.get("alpha_1m_vs_benchmark")
+        alpha_txt = f"{alpha:+.1f} pp vs {bench}" if alpha is not None else f"b/d vs {bench}"
+        vol = tech.get("volume_ratio_10d")
+        vol_txt = f"{vol:.2f}x" if vol is not None else "b/d"
+        signal = generate_technical_signal(
+            tech.get("rsi_14"),
+            tech.get("price_vs_sma20"),
+            tech.get("price_vs_sma50"),
+            tech.get("macd_trend"),
+            tech.get("bollinger_signal"),
+        )
+        tech_txt = f"{signal} ({trend_label(tech)})"
+        earnings = (data.get("earnings_dates") or {}).get(ticker) or {}
+        days = earnings.get("days_until")
+        if days is not None:
+            earn_txt = f"{earnings.get('date', 'b/d')} ({days}d)"
+        else:
+            earn_txt = "b/d"
+        flags = []
+        high = fund.get("pct_from_52w_high")
+        if high is not None:
+            flags.append(f"52w {high:+.1f}%")
+        short_pct = _short_pct_display(fund)
+        if short_pct is not None and short_pct > 10:
+            flags.append(f"short {short_pct:.1f}%")
+        flags.append(_insider_flag(fund))
+        lines.append(
+            f"| **{name}** ({ticker}) | {price} | {change_1d} | {change_5d_txt} "
+            f"| {alpha_txt} | {vol_txt} | {tech_txt} | {earn_txt} | {'; '.join(flags)} |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
 def build_benchmarks_md(data: dict) -> str:
     """## 2. Benchmarki rynkowe — SPX, NDX, SX5E, WIG20: poziom, 1D, 1T, YTD."""
     v2 = data["v2"]
@@ -179,12 +252,32 @@ def build_macro_md(data: dict) -> str:
     lines.append("")
     lines.append("Legenda ważności: 🔴 wysoki wpływ, 🟠 średni wpływ, 🟢 niski wpływ.")
     lines.append("")
+    upcoming = []
+    for ticker, info in (data.get("earnings_dates") or {}).items():
+        days = info.get("days_until")
+        if days is None:
+            continue
+        upcoming.append((days, ticker, info))
+    if upcoming:
+        upcoming.sort()
+        lines.append("**Wyniki spółek portfela:**")
+        for days, ticker, info in upcoming[:8]:
+            lines.append(
+                f"- **{TICKER_NAMES.get(ticker, ticker)}** ({ticker}): "
+                f"{info.get('date', 'b/d')} (za {days} dni)"
+            )
+        lines.append("")
     return "\n".join(lines)
 
 
-def _movers_table(movers: list, is_us: bool = True) -> list[str]:
-    """Tabela top movers w formacie zgodnym z v1 (render_basic_report)."""
-    lines = ["| Spółka | Kurs | Zmiana |", "|--------|------|--------|"]
+def _movers_table(movers: list, is_us: bool = True, with_notes: bool = False) -> list[str]:
+    """Tabela top movers: wzrosty albo spadki, z wolumenem."""
+    header = "| Spółka | Kurs | Zmiana | Wolumen |"
+    sep = "|--------|------|--------|---------|"
+    if with_notes:
+        header += " Notatka |"
+        sep += "---------|"
+    lines = [header, sep]
     for ticker, q in movers:
         name_disp = TICKER_NAMES.get(ticker, ticker)
         if is_us:
@@ -192,30 +285,58 @@ def _movers_table(movers: list, is_us: bool = True) -> list[str]:
             price_disp = f"{q['price']:.2f}" if is_eu else f"${q['price']:.2f}"
         else:
             price_disp = f"{q['price']:.2f} PLN"
-        lines.append(f"| **{name_disp}** ({ticker}) | {price_disp} | {format_change(q['change_pct'])} |")
+        ratio = q.get("volume_ratio")
+        vol_txt = f"{ratio:.2f}x" if ratio is not None else "b/d"
+        row = (
+            f"| **{name_disp}** ({ticker}) | {price_disp} | "
+            f"{format_change(q.get('change_pct', 0))} | {vol_txt} |"
+        )
+        if with_notes:
+            note = RADAR_NOTES.get(ticker, "")
+            row = row[:-1] + f" {note} |"
+        lines.append(row)
     return lines
 
 
+def _append_mover_group(lines: list[str], title: str, winners: list, losers: list, is_us: bool, with_notes: bool = False):
+    if not winners and not losers:
+        return
+    lines.append(f"### {title}")
+    lines.append("")
+    if winners:
+        lines.append("**Wzrosty**")
+        lines.append("")
+        lines.extend(_movers_table(winners, is_us=is_us, with_notes=with_notes))
+        lines.append("")
+    if losers:
+        lines.append("**Spadki**")
+        lines.append("")
+        lines.extend(_movers_table(losers, is_us=is_us, with_notes=with_notes))
+        lines.append("")
+
+
 def build_movers_md(data: dict) -> str:
-    """## 6. Radar rynkowy — układ z v1: podsekcje USA/GPW/AI Bottlenecks z tabelami."""
+    """## 6. Radar rynkowy — wzrosty/spadki + wolumen, bez spółek portfela."""
     movers = data["today_movers"]
     lines = ["## 6. Radar rynkowy -- Największe ruchy dnia", ""]
+    sc_notes = bool(
+        RADAR_NOTES
+        and any(t in RADAR_NOTES for t, _ in (movers.get("sc_winners") or []) + (movers.get("sc_losers") or []))
+    )
 
-    if data["us_active"] and (movers["us_winners"] or movers["us_losers"]):
-        lines.append("### USA -- Top movers")
-        lines.append("")
-        lines.extend(_movers_table(movers["us_winners"] + movers["us_losers"], is_us=True))
-        lines.append("")
-    if data["pl_active"] and (movers["gpw_winners"] or movers["gpw_losers"]):
-        lines.append("### GPW -- Top movers")
-        lines.append("")
-        lines.extend(_movers_table(movers["gpw_winners"] + movers["gpw_losers"], is_us=False))
-        lines.append("")
-    if data["us_active"] and (movers["sc_winners"] or movers["sc_losers"]):
-        lines.append("### Sektor AI Bottlenecks (Small/Mid-Caps) -- Top movers")
-        lines.append("")
-        lines.extend(_movers_table(movers["sc_winners"] + movers["sc_losers"], is_us=True))
-        lines.append("")
+    if data["us_active"]:
+        _append_mover_group(lines, "USA -- Top movers", movers["us_winners"], movers["us_losers"], True)
+    if data["pl_active"]:
+        _append_mover_group(lines, "GPW -- Top movers", movers["gpw_winners"], movers["gpw_losers"], False)
+    if data["us_active"]:
+        _append_mover_group(
+            lines,
+            "Sektor AI Bottlenecks (Small/Mid-Caps) -- Top movers",
+            movers["sc_winners"],
+            movers["sc_losers"],
+            True,
+            with_notes=sc_notes,
+        )
     return "\n".join(lines)
 
 
@@ -229,13 +350,10 @@ def _fmt_ratio(val: Optional[float], as_pct: bool = False) -> str:
 
 
 def build_valuation_md(data: dict) -> str:
-    """## 8. Wycena i technika — wskaźniki wyceny + sygnał techniczny per spółka portfela."""
+    """## 8. Wycena i technika — wąska tabela dzienna; sobota: druga warstwa szczegółów."""
     lines = ["## 8. Wycena i technika", ""]
-    lines.append(
-        "| Spółka | Fwd P/E | Trailing P/E | EV/EBITDA | PEG | P/B "
-        "| FCF Yield | ROE | Debt/EBITDA | Marża oper. | Sygnał tech. |"
-    )
-    lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
+    lines.append("| Spółka | Fwd P/E | EV/EBITDA | FCF Yield | vs 52w | Sygnał tech. |")
+    lines.append("| :--- | :---: | :---: | :---: | :---: | :--- |")
     for ticker in data["active_tickers"]:
         details = data["portfolio_details"].get(ticker, {}) or {}
         fund = details.get("fundamentals") or {}
@@ -249,19 +367,31 @@ def build_valuation_md(data: dict) -> str:
         )
         fcf_yield = fund.get("fcf_yield_pct")
         fcf_str = f"{fcf_yield:.1f}%" if fcf_yield is not None else "b/d"
+        high = fund.get("pct_from_52w_high")
+        high_str = f"{high:+.1f}%" if high is not None else "b/d"
         lines.append(
             f"| **{ticker}** | {_fmt_ratio(fund.get('forward_pe'))} "
-            f"| {_fmt_ratio(fund.get('trailing_pe'))} "
             f"| {_fmt_ratio(fund.get('ev_to_ebitda'))} "
-            f"| {_fmt_ratio(fund.get('peg_ratio'))} "
-            f"| {_fmt_ratio(fund.get('price_to_book'))} "
-            f"| {fcf_str} "
-            f"| {_fmt_ratio(fund.get('return_on_equity'), as_pct=True)} "
-            f"| {_fmt_ratio(fund.get('debt_to_ebitda'))} "
-            f"| {_fmt_ratio(fund.get('operating_margin'), as_pct=True)} "
+            f"| {fcf_str} | {high_str} "
             f"| {signal} ({trend_label(tech)}) |"
         )
     lines.append("")
+    if data.get("is_saturday"):
+        lines.append("### Wycena — szczegóły")
+        lines.append("")
+        lines.append("| Spółka | Trailing P/E | PEG | P/B | ROE | Debt/EBITDA | Marża oper. |")
+        lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: |")
+        for ticker in data["active_tickers"]:
+            fund = (data["portfolio_details"].get(ticker, {}) or {}).get("fundamentals") or {}
+            lines.append(
+                f"| **{ticker}** | {_fmt_ratio(fund.get('trailing_pe'))} "
+                f"| {_fmt_ratio(fund.get('peg_ratio'))} "
+                f"| {_fmt_ratio(fund.get('price_to_book'))} "
+                f"| {_fmt_ratio(fund.get('return_on_equity'), as_pct=True)} "
+                f"| {_fmt_ratio(fund.get('debt_to_ebitda'))} "
+                f"| {_fmt_ratio(fund.get('operating_margin'), as_pct=True)} |"
+            )
+        lines.append("")
     lines.append(
         "> Interpretacja: wartości porównuj ze średnią sektorową (semis: EV/EBITDA ~15-25, "
         "GPW: P/E ~8-15). \"b/d\" = wskaźnik niedostępny w yfinance (częste dla GPW i spółek bez zysków)."
@@ -300,8 +430,7 @@ def _fmt_analyst_recs(ticker: str, recs: dict, price: Optional[float]) -> list[s
 
 
 def _company_data_block(data: dict) -> str:
-    """Kompaktowe fakty per spółka portfela — wsad dla prompta Gemini (sekcja 4)
-    i dla fallbacku regułowego."""
+    """Jedyny kanoniczny blok faktów per spółka — wsad dla prompta Gemini."""
     v2 = data.get("v2", {})
     out = []
     for t in data["active_tickers"]:
@@ -312,16 +441,47 @@ def _company_data_block(data: dict) -> str:
 
         out.append(f"    {TICKER_NAMES.get(t, t)} ({t}):")
         out.append(f"      notowanie: {_fmt_quote_line(t, q)}")
-        out.append(f"      wolumen vs średnia 10 sesji: {_v(tech.get('volume_ratio_10d'), 'x')}")
+        out.append(
+            f"      technika: RSI {_v(tech.get('rsi_14'))}, vs SMA20 {_v(tech.get('price_vs_sma20'), '%')}, "
+            f"vs SMA50 {_v(tech.get('price_vs_sma50'), '%')}, MACD hist {_v(tech.get('macd_histogram'))} "
+            f"({_v(tech.get('macd_trend'))}), Bollinger {_v(tech.get('bollinger_position'))} "
+            f"({_v(tech.get('bollinger_signal'))}), zmiana 5 sesji {_v(tech.get('change_5d'), '%')}, "
+            f"wolumen {_v(tech.get('volume_ratio_10d'), 'x śr. 10d')}"
+        )
+        out.append(
+            f"      trend: układ średnich {_v(tech.get('ema_stack'))}, ADX {_v(tech.get('adx'))} "
+            f"(+DI {_v(tech.get('plus_di'))} / -DI {_v(tech.get('minus_di'))}), "
+            f"Supertrend {_v(tech.get('supertrend_dir'))}, Ichimoku {_v(tech.get('ichimoku_cloud'))}, "
+            f"Donchian {_v(tech.get('donchian_signal'))}, ATR {_v(tech.get('atr_pct'), '%')}, "
+            f"nachylenie regresji {_v(tech.get('reg_slope_pct'), '%/sesję')}"
+        )
+        mcap = fund.get("market_cap")
+        mcap_ccy = "PLN" if t.endswith(".WA") else "USD"
+        mcap_txt = f"{mcap / 1e9:.1f} mld {mcap_ccy}" if mcap else "b/d"
+        short_pct = _short_pct_display(fund)
+        out.append(
+            f"      fundamenty: fwd P/E {_v(fund.get('forward_pe'))}, P/S {_v(fund.get('price_to_sales'))}, "
+            f"kapitalizacja {mcap_txt}, {_v(fund.get('pct_from_52w_high'), '%')} od szczytu 52w, "
+            f"{_v(fund.get('pct_from_52w_low'), '%')} od dołka 52w, short float {_v(short_pct, '%')}"
+        )
+        bench = details.get("benchmark") or (PL_BENCHMARK if t.endswith(".WA") else US_BENCHMARK)
+        out.append(
+            f"      alpha 1M vs benchmark sektorowy ({bench}): "
+            f"{_v(details.get('alpha_1m_vs_benchmark'), ' pp')}"
+        )
 
         earnings = (data.get("earnings_dates") or {}).get(t)
         if earnings:
             out.append(
                 f"      wyniki: {earnings.get('date')} (za {earnings.get('days_until', '?')} dni)"
             )
+        for item in ((data.get("earnings_call_context") or {}).get(t) or [])[:2]:
+            title = item.get("title") or item.get("quarter") or "earnings call"
+            summary = (item.get("summary") or "")[:280]
+            url = item.get("url") or ""
+            out.append(f"      earnings call: {title} — {summary} {url}".strip())
 
         out.extend(_fmt_analyst_recs(t, (v2.get("analyst_recs") or {}).get(t, {}), q.get("price")))
-
         out.extend(format_insider_lines(t, fund))
 
         deltas = calculate_deltas(
@@ -339,7 +499,10 @@ def _company_data_block(data: dict) -> str:
             out.append(f"      co się zmieniło od poprzedniego raportu: {', '.join(deltas)}")
 
         for a in (data.get("news_data") or {}).get(t, [])[:3]:
-            out.append(f"      news: [{a.get('publisher')}] {a.get('title')} | {a.get('url', '')}")
+            date_txt = a.get("date") or "b/d"
+            out.append(
+                f"      news ({date_txt}): [{a.get('publisher')}] {a.get('title')} | {a.get('url', '')}"
+            )
 
         note = TICKER_NOTES.get(t)
         if note:
@@ -358,7 +521,10 @@ def _macro_news_block(data: dict, max_lines: int = 15) -> str:
             continue
         label = TICKER_NAMES.get(ticker, ticker)
         for a in articles:
-            out.append(f"    - [{a.get('publisher')}] ({label}) {a.get('title')} | {a.get('url', '')}")
+            date_txt = a.get("date") or "b/d"
+            out.append(
+                f"    - ({date_txt}) [{a.get('publisher')}] ({label}) {a.get('title')} | {a.get('url', '')}"
+            )
             if len(out) >= max_lines:
                 return "\n".join(out)
     return "\n".join(out) if out else "    - brak newsów makro w danych"
@@ -402,175 +568,21 @@ def _sentiment_data_block(data: dict) -> str:
 
 
 # ============================================================
-# Renderer AI (Gemini) z exponential backoff
+# Renderer AI — HTTP w gemini_client.py
 # ============================================================
 
-# Łańcuch modeli zapasowych: gdy podstawowy padnie (503 / 504 / quota),
-# próbujemy kolejnych — każdy ma OSOBNĄ pulę limitów.
+# Re-eksport stałych (testy / diagnostyka).
 GEMINI_DEFAULT_MODEL = "gemini-3.8-flash"
-GEMINI_FALLBACK_CHAIN = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash"]
-
-# Próby per model: backoff w sekundach (pierwsza natychmiast, druga po 10s).
-GEMINI_MODEL_BACKOFF = [0, 10]
-
-# Łączny budżet czasu dla całej fazy Gemini (retry + zapasowe modele).
-GEMINI_TIMEOUT_SECONDS = 360
-# Twardy limit JEDNEJ próby — nie może zjeść całego budżetu, inaczej
-# łańcuch zapasowy nigdy nie wystartuje (jak 03.09.2026: 504 po 179s).
-GEMINI_ATTEMPT_TIMEOUT_SECONDS = 75
 
 
-def _build_model_chain() -> list[str]:
-    """Podstawowy model (GEMINI_MODEL lub gemini-3.8-flash) + zapasowe,
-    zdeduplikowane z zachowaniem kolejności."""
-    primary = os.getenv("GEMINI_MODEL") or GEMINI_DEFAULT_MODEL
-    chain = []
-    for model in [primary] + GEMINI_FALLBACK_CHAIN:
-        if model not in chain:
-            chain.append(model)
-    return chain
-
-
-def _generate_content_config():
-    """Wyłącza AFC — inaczej SDK woła narzędzia (max 10 remote calls) i request
-    wisi aż do 504 zamiast zwrócić sam tekst raportu."""
-    if genai_types is None:
-        return None
-    afc = getattr(genai_types, "AutomaticFunctionCallingConfig", None)
-    cfg_cls = getattr(genai_types, "GenerateContentConfig", None)
-    if afc is None or cfg_cls is None:
-        return None
-    return cfg_cls(automatic_function_calling=afc(disable=True))
-
-
-def _is_daily_quota_error(err_text: str) -> bool:
-    """Rozpoznaje wyczerpaną DOBOWĄ quotę (czekanie nie pomoże — trzeba zmienić model)."""
-    t = err_text.lower()
-    return ("resource_exhausted" in t or "429" in t) and (
-        "perday" in t or "per day" in t or "limit: 0" in t
-    )
-
-
-def _generate_content_with_timeout(
-    prompt: str,
-    api_key: str,
-    model_name: str,
-    timeout_seconds: float,
-):
-    """Wykonuje jedno żądanie Gemini z twardym limitem czasu.
-
-    Timeout biblioteki jest przekazywany również do serwera, ale na Windowsie
-    zerwane lub zawieszone połączenie nie zawsze kończy się punktualnie. Osobny
-    wątek daemon gwarantuje, że sterowanie wróci po wykorzystaniu pozostałego
-    budżetu czasu.
-    """
-    result_queue = queue.Queue(maxsize=1)
-    timeout_ms = max(1, int(timeout_seconds * 1000))
-
-    def run_request():
-        client = None
-        try:
-            client = genai.Client(
-                api_key=api_key,
-                http_options=genai_types.HttpOptions(
-                    timeout=timeout_ms,
-                ),
-            )
-            kwargs = {
-                "model": model_name,
-                "contents": prompt,
-            }
-            config = _generate_content_config()
-            if config is not None:
-                kwargs["config"] = config
-            response = client.models.generate_content(**kwargs)
-            result_queue.put((True, response))
-        except BaseException as exc:
-            result_queue.put((False, exc))
-        finally:
-            close = getattr(client, "close", None)
-            if close:
-                close()
-
-    request_thread = threading.Thread(
-        target=run_request,
-        name=f"gemini-{model_name}",
-        daemon=True,
-    )
-    request_thread.start()
-    request_thread.join(timeout_seconds)
-
-    if request_thread.is_alive():
-        raise TimeoutError(
-            f"Przekroczono pozostały limit {timeout_seconds:.0f}s "
-            f"dla modelu {model_name}."
-        )
-
-    succeeded, result = result_queue.get_nowait()
-    if succeeded:
-        return result
-    raise result
-
-
-def _call_gemini_v2(prompt: str, api_key: str) -> str:
-    """Wywołanie Gemini z łańcuchem modeli zapasowych.
-
-    Dla każdego modelu (gemini-3.8-flash -> gemini-3.7-flash -> gemini-3.5-flash)
-    do 2 prób z backoffem 0/10s. Wyczerpana DOBOWA quota danego modelu → od razu
-    następny model (czekanie nic nie da). 503/504/limit per-minute → druga próba,
-    potem następny model. Jedna próba ma własny limit (75s), żeby 504 nie spalił
-    całego budżetu. Po wyczerpaniu łańcucha rzuca wyjątek (fallback regułowy
-    przejmuje w report_builder.build_report)."""
-    chain = _build_model_chain()
-    deadline = time.monotonic() + GEMINI_TIMEOUT_SECONDS
-    logger.info(f"Layout v2 — łańcuch modeli Gemini: {' -> '.join(chain)}")
+def _call_gemini_v2(prompt: str, api_key: str) -> tuple[str, str]:
+    """Zwraca (tekst, nazwa_modelu). Fallback regułowy łapie wyjątek wyżej."""
     logger.info(
-        f"Layout v2 — łączny timeout Gemini: {GEMINI_TIMEOUT_SECONDS}s "
-        f"(max {GEMINI_ATTEMPT_TIMEOUT_SECONDS}s na próbę)."
+        f"Layout v2 — timeout Gemini: {GEMINI_TIMEOUT_SECONDS}s "
+        f"(max {GEMINI_ATTEMPT_TIMEOUT_SECONDS}s na próbę), "
+        f"łańcuch zapasowy: {' -> '.join(GEMINI_FALLBACK_CHAIN)}"
     )
-
-    last_error: Optional[Exception] = None
-    for model_name in chain:
-        for attempt, delay in enumerate(GEMINI_MODEL_BACKOFF, start=1):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(
-                    f"Przekroczono łączny limit {GEMINI_TIMEOUT_SECONDS}s dla Gemini."
-                ) from last_error
-            if delay:
-                if delay >= remaining:
-                    raise TimeoutError(
-                        f"Przekroczono łączny limit {GEMINI_TIMEOUT_SECONDS}s dla Gemini."
-                    ) from last_error
-                logger.info(f"Layout v2 — [{model_name}] czekam {delay}s przed próbą {attempt}...")
-                time.sleep(delay)
-                remaining = deadline - time.monotonic()
-            try:
-                logger.info(
-                    f"Layout v2 — [{model_name}] próba {attempt}/{len(GEMINI_MODEL_BACKOFF)} "
-                    f"zapytania do Gemini..."
-                )
-                attempt_timeout = min(remaining, float(GEMINI_ATTEMPT_TIMEOUT_SECONDS))
-                response = _generate_content_with_timeout(
-                    prompt,
-                    api_key,
-                    model_name,
-                    attempt_timeout,
-                )
-                if not response.text:
-                    raise Exception("Pusta odpowiedź z Gemini.")
-                logger.info(f"Layout v2 — odpowiedź z modelu {model_name}.")
-                return response.text
-            except Exception as e:
-                last_error = e
-                logger.warning(f"Layout v2 — [{model_name}] próba {attempt} nieudana: {e}")
-                if _is_daily_quota_error(str(e)):
-                    logger.info(
-                        f"Layout v2 — [{model_name}] wyczerpana dobowa quota, "
-                        f"przechodzę do kolejnego modelu."
-                    )
-                    break
-    raise last_error or Exception("Gemini v2: wszystkie modele nieudane")
+    return call_gemini(prompt, api_key)
 
 
 def _parse_ai_sections(text: str, headers: Optional[list] = None) -> dict:
@@ -717,6 +729,8 @@ def _build_prompt_v2(data: dict) -> str:
     i innymi informacjami nadchodzącymi. Nie twórz katalizatora, którego nie ma w danych.
     Format każdej prognozy MUSI być:
     - TICKER: kierunek=up/down/neutral; horyzont=5 sesji; pewność=niska|średnia|wysoka; katalizatory=...; ryzyka=...; unieważnienie=...; teza=jednozdaniowa teza.
+    Nie używaj kierunku=neutral, gdy ATR% > 5, chyba że teza podaje konkretny przedział cenowy
+    (np. 100-110). Goły neutral przy wysokim ATR to błąd.
     """
 
     n_sections = "osiem" if is_saturday else "sześć"
@@ -729,9 +743,8 @@ def _build_prompt_v2(data: dict) -> str:
     bez głównego tytułu raportu):
 
     ## 1. Executive Summary
-    5-10 zwięzłych punktów do przeczytania w minutę: co wydarzyło się od poprzedniego raportu
-    (wykorzystaj pola "co się zmieniło od poprzedniego raportu" z danych spółek), które spółki
-    wymagają dziś uwagi i dlaczego, najważniejsze informacje makro, czy zmienił się sentyment rynku.
+    5-7 zwięzłych punktów. Każdy punkt MUSI wskazywać ticker albo datę makro — bez ogólników
+    o "sentymencie rynkowym" bez liczby. Wykorzystaj pola "co się zmieniło od poprzedniego raportu".
     Każdy punkt oznacz wagą: 🔴 (wysoki wpływ), 🟠 (średni), 🟢 (niski).
 
     ## 4. Monitoring spółek
@@ -754,18 +767,18 @@ def _build_prompt_v2(data: dict) -> str:
     NIE wymyślaj wydarzeń spoza dostarczonych danych.
 
     ## 7. Ryzyka
-    Krótka lista (3-6 punktów) ryzyk popartych WYŁĄCZNIE dostarczonymi danymi: wydarzenia makro
-    wysokiej wagi, posiedzenia banków centralnych, wysoki short interest, bliskie publikacje
-    wyników, konkretne newsy o regulacjach/geopolityce/konkurencji. Każde ryzyko z wagą 🔴/🟠/🟢.
+    3-6 punktów TYLKO z datą albo progiem w danych (FOMC/CPI, earnings ≤7 dni, short >10%,
+    konkretny news regulacyjny). Bez spekulacji. Każde ryzyko z wagą 🔴/🟠/🟢.
 
     ## 9. Sentyment
-    Synteza nastroju rynku z dostarczonych PROXY (nazwij wprost źródła): poziom VIX, short interest,
-    sygnały insiderów, nietypowy wolumen, kierunek zmian rekomendacji analityków, ton newsów.
-    Werdykt: czy news flow jest pozytywny/negatywny/mieszany i czy sentyment się zmienia.
+    4-6 zdań o RYNKU (nie recytuj spółek portfela punkt po punkcie — to jest sekcja 4).
+    Nazwij źródła: VIX, insiderzy łącznie, wolumen, kierunek rekomendacji, ton newsów.
+    Werdykt: news flow pozytywny/negatywny/mieszany i czy sentyment się zmienia.
 
     ## 10. Watchlist
-    Spółki wymagające obserwacji DZIŚ (z portfela lub top movers). Dla każdej: dlaczego,
-    co może być katalizatorem, na co konkretnie zwrócić uwagę (poziom ceny, wskaźnik, data).
+    TYLKO spółki SPOZA portfela (top movers / radar). Portfel jest w sekcji 4 — nie powtarzaj go.
+    Dla każdej: dlaczego, katalizator, na co zwrócić uwagę (poziom, wskaźnik, data).
+    Jeśli nie ma sensownego kandydata poza portfelem, napisz to wprost.
     {saturday_sections}
     ZASADY (bezwzględnie przestrzegaj):
     - NIE wymyślaj newsów, wydarzeń ani danych spoza dostarczonych poniżej.
@@ -791,11 +804,8 @@ def _build_prompt_v2(data: dict) -> str:
     KALENDARZ MAKRO:
 {macro_cal_lines}
 
-    SPÓŁKI PORTFELA (notowania, wolumen, rekomendacje, insiderzy, zmiany od poprzedniego raportu, newsy):
+    SPÓŁKI PORTFELA (jedyny blok: notowania, technika, fundamenty, insiderzy, newsy z datą):
 {_company_data_block(data)}
-
-    PEŁNA TECHNIKA I FUNDAMENTY PORTFELA:
-{_fmt_portfolio_block(data["portfolio_details"])}
 
     NADCHODZĄCE WYNIKI:
 {_fmt_earnings(data.get("earnings_dates") or {})}
@@ -867,11 +877,71 @@ def _saturday_extras_md(data: dict) -> str:
     return md
 
 
+def _humanize_predictions_section(section: str) -> str:
+    """Tabela czytelna w mailu + oryginalne bullety dla parsera accuracy_tracker."""
+    if not section:
+        return section
+    lines = section.splitlines()
+    header = []
+    bullets = []
+    rest_pre = []
+    seen_header = False
+    for line in lines:
+        if line.startswith(PREDICTIONS_HEADER):
+            header.append(line)
+            seen_header = True
+            continue
+        if seen_header and re.search(r"kierunek\s*[:=]\s*(up|down|neutral)", line, re.I):
+            bullets.append(line)
+        elif seen_header and not bullets:
+            rest_pre.append(line)
+        elif seen_header:
+            rest_pre.append(line)
+        else:
+            header.append(line)
+
+    if not bullets:
+        return section
+
+    table = [
+        "| Spółka | Kierunek | Pewność | Teza |",
+        "| :--- | :--- | :--- | :--- |",
+    ]
+    dir_pl = {"up": "wzrost", "down": "spadek", "neutral": "neutral"}
+    for line in bullets:
+        ticker_m = re.search(r"\b([A-Z]{1,6}(?:\.[A-Z]{1,3})?)\b", line)
+        dir_m = re.search(r"kierunek\s*[:=]\s*(up|down|neutral)", line, re.I)
+        conf_m = re.search(
+            r"(?:pewność|pewnosc|confidence)\s*[:=]\s*(niska|średnia|srednia|wysoka|low|medium|high)",
+            line,
+            re.I,
+        )
+        thesis_m = re.search(r"teza\s*[:=]\s*(.+)$", line, re.I)
+        ticker = ticker_m.group(1) if ticker_m else "b/d"
+        direction = dir_pl.get((dir_m.group(1).lower() if dir_m else ""), "b/d")
+        confidence = conf_m.group(1) if conf_m else "b/d"
+        thesis = (thesis_m.group(1).strip() if thesis_m else line.strip("- ").strip())
+        table.append(f"| **{ticker}** | {direction} | {confidence} | {thesis} |")
+
+    out = header + rest_pre + [""] + table + ["", "*Format rozliczeniowy (parser):*", ""] + bullets
+    return "\n".join(out)
+
+
+def _source_footer(data: dict) -> str:
+    source = data.get("analysis_source") or "b/d"
+    n_chars = data.get("report_chars")
+    extra = f", {n_chars} znaków" if n_chars else ""
+    return f"*Źródło analizy: {source}{extra}.*"
+
+
 def _assemble_report(data: dict, ai_sections: dict) -> str:
-    """Składa finalny raport v2: nagłówek + sekcje 1-10 w kolejności + disclaimer.
-    W sobotę dodatkowo: analiza trendu, trafność prognoz i prognozy do weryfikacji."""
+    """Składa finalny raport v2: nagłówek + pozycje + sekcje 1-10 + disclaimer."""
+    predictions_md = _humanize_predictions_section(ai_sections.get(PREDICTIONS_HEADER, ""))
     parts = [
         _header_v2(data["now"], data["skip"], data["status"]).rstrip("\n"),
+        "",
+        build_positions_md(data),
+        "---",
         "",
         ai_sections["## 1. Executive Summary"],
         "",
@@ -915,7 +985,7 @@ def _assemble_report(data: dict, ai_sections: dict) -> str:
             _saturday_extras_md(data),
             ai_sections.get(PREDICTION_REVIEW_HEADER, ""),
             "",
-            ai_sections.get(PREDICTIONS_HEADER, ""),
+            predictions_md,
             "",
             "---",
             "",
@@ -923,6 +993,8 @@ def _assemble_report(data: dict, ai_sections: dict) -> str:
     parts.append(
         "> **Disclaimer**: Raport ma charakter informacyjny i nie stanowi rekomendacji inwestycyjnej."
     )
+    parts.append("")
+    parts.append(_source_footer(data))
     return "\n".join(parts)
 
 
@@ -932,7 +1004,8 @@ def render_ai_report_v2(data: dict, api_key: str) -> str:
     is_saturday = data.get("is_saturday", False)
     headers = V2_AI_HEADERS + ([PREDICTION_REVIEW_HEADER, PREDICTIONS_HEADER] if is_saturday else [])
     prompt = _build_prompt_v2(data)
-    response_text = _call_gemini_v2(prompt, api_key)
+    response_text, model_name = _call_gemini_v2(prompt, api_key)
+    data["analysis_source"] = f"Gemini {model_name}"
     ai_sections = _parse_ai_sections(response_text, headers)
     gemini_predictions = []
     if is_saturday:
@@ -1013,7 +1086,6 @@ def _basic_executive_summary(data: dict) -> str:
         lines.append(f"- 🟠 VIX {vix['price']:.2f} ({format_change(vix.get('change_pct', 0))}) — sentyment {mood}.")
 
     lines.append("")
-    lines.append("*Sekcja wygenerowana regułowo (fallback bez AI).*")
     lines.append("")
     return "\n".join(lines)
 
@@ -1062,7 +1134,6 @@ def _basic_monitoring(data: dict) -> str:
             lines.append(f"> {note}")
         lines.append(f"**Wpływ: {_basic_company_impact(q, tech)}**")
         lines.append("")
-    lines.append("*Sekcja wygenerowana regułowo (fallback bez AI).*")
     lines.append("")
     return "\n".join(lines)
 
@@ -1080,7 +1151,6 @@ def _basic_macro_top5(data: dict) -> str:
     if len(lines) == 2:
         lines.append("- brak wydarzeń makro w danych")
     lines.append("")
-    lines.append("*Sekcja wygenerowana regułowo (fallback bez AI).*")
     lines.append("")
     return "\n".join(lines)
 
@@ -1105,7 +1175,6 @@ def _basic_risks(data: dict) -> str:
     if len(lines) == 2:
         lines.append("- 🟢 Brak zidentyfikowanych ryzyk w dostępnych danych.")
     lines.append("")
-    lines.append("*Sekcja wygenerowana regułowo (fallback bez AI).*")
     lines.append("")
     return "\n".join(lines)
 
@@ -1125,32 +1194,42 @@ def _basic_sentiment(data: dict) -> str:
         lines.append("")
         lines.append(f"**Werdykt (regułowy, wg VIX): {verdict}.**")
     lines.append("")
-    lines.append("*Sekcja wygenerowana regułowo (fallback bez AI).*")
     lines.append("")
     return "\n".join(lines)
 
 
 def _basic_watchlist(data: dict) -> str:
-    """Regułowa sekcja 10: spółki z alertami technicznymi lub bliskimi wynikami."""
+    """Regułowa sekcja 10: tylko spółki spoza portfela (top movers)."""
     lines = ["## 10. Watchlist", ""]
+    portfolio = set(data.get("active_tickers") or [])
     entries = []
-    for t in data["active_tickers"]:
-        details = data["portfolio_details"].get(t, {}) or {}
-        details = dict(details)
-        details["earnings"] = (data.get("earnings_dates") or {}).get(t, {})
-        alerts = generate_alerts(t, details, (data.get("last_snapshots") or {}).get(t))
-        for alert in alerts:
-            entries.append(f"- **{t}**: {alert} — katalizator techniczny, obserwuj reakcję kursu.")
-        earnings = (data.get("earnings_dates") or {}).get(t, {})
-        days = earnings.get("days_until")
-        if days is not None and 0 <= days <= 7:
+    movers = data.get("today_movers") or {}
+    for group in ("us_winners", "us_losers", "gpw_winners", "gpw_losers", "sc_winners", "sc_losers"):
+        for ticker, q in movers.get(group) or []:
+            if ticker in portfolio:
+                continue
+            change = q.get("change_pct")
+            vol = q.get("volume_ratio")
+            vol_txt = f", wolumen {vol:.2f}x" if vol is not None else ""
+            note = RADAR_NOTES.get(ticker)
+            note_txt = f" ({note})" if note else ""
             entries.append(
-                f"- **{t}**: wyniki {earnings.get('date')} (za {days} dni) — "
-                f"katalizator fundamentalny, zwróć uwagę na guidance."
+                f"- **{TICKER_NAMES.get(ticker, ticker)}** ({ticker}): "
+                f"{format_change(change) if change is not None else 'b/d'}{vol_txt}{note_txt} "
+                f"— poza portfelem, obserwuj kontynuację ruchu."
             )
-    lines.extend(entries or ["- Brak spółek wymagających szczególnej obserwacji według reguł."])
+    # unikalne, max 6
+    seen = set()
+    unique = []
+    for item in entries:
+        if item in seen:
+            continue
+        seen.add(item)
+        unique.append(item)
+        if len(unique) >= 6:
+            break
+    lines.extend(unique or ["- Brak spółek spoza portfela wymagających szczególnej obserwacji."])
     lines.append("")
-    lines.append("*Sekcja wygenerowana regułowo (fallback bez AI).*")
     lines.append("")
     return "\n".join(lines)
 
@@ -1192,7 +1271,6 @@ def _basic_prediction_reviews(data: dict) -> str:
             f"wyjaśnienie={explanation}; przeważyło={driver}; lekcja={lesson}"
         )
     lines.append("")
-    lines.append("*Sekcja wygenerowana regułowo (fallback bez AI).*")
     lines.append("")
     return "\n".join(lines)
 
@@ -1224,6 +1302,7 @@ def _basic_predictions(data: dict) -> str:
 def render_basic_report_v2(data: dict) -> str:
     """Pełny raport v2 bez AI — te same sekcje deterministyczne, narracyjne z reguł."""
     logger.info("Layout v2: generowanie raportu regułowego (fallback bez AI)...")
+    data["analysis_source"] = "fallback regułowy"
     ai_sections = {
         "## 1. Executive Summary": _basic_executive_summary(data).rstrip("\n"),
         "## 4. Monitoring spółek": _basic_monitoring(data).rstrip("\n"),

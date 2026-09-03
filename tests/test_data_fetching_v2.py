@@ -298,6 +298,7 @@ def test_get_index_tickers_v2_fallback_to_epol(monkeypatch):
     )
     idx = data_fetching.get_index_tickers_v2()
     assert idx["Euro Stoxx 50"] == "^STOXX50E"
+    assert idx["SMH (semis)"] == "SMH"
     assert idx["WIG20 (Proxy EPOL)"] == "EPOL"
 
 
@@ -320,3 +321,22 @@ def test_get_index_tickers_v2_single_row_history_falls_back(monkeypatch):
     monkeypatch.setattr(data_fetching, "fetch_period_change", lambda t, period="7d": None)
     idx = data_fetching.get_index_tickers_v2()
     assert idx["WIG20 (Proxy EPOL)"] == "EPOL"
+
+
+def test_get_top_movers_excludes_portfolio_and_low_volume(monkeypatch):
+    quotes = {
+        "NVDA": {"error": False, "change_pct": 8.0, "volume_ratio": 2.0, "price": 200},
+        "MU": {"error": False, "change_pct": 7.0, "volume_ratio": 2.0, "price": 100},
+        "INTC": {"error": False, "change_pct": -6.0, "volume_ratio": 1.5, "price": 30},
+        "AMD": {"error": False, "change_pct": 5.0, "volume_ratio": 0.4, "price": 90},
+    }
+    monkeypatch.setattr(data_fetching, "fetch_quotes_batch", lambda tickers, period="5d": quotes)
+    winners, losers = data_fetching.get_top_movers(
+        list(quotes), top_n=3, exclude=["MU"], min_volume_ratio=0.7,
+    )
+    winner_tickers = [t for t, _ in winners]
+    loser_tickers = [t for t, _ in losers]
+    assert "MU" not in winner_tickers
+    assert "AMD" not in winner_tickers
+    assert winner_tickers[0] == "NVDA"
+    assert "INTC" in loser_tickers

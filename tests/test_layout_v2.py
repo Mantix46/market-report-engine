@@ -376,7 +376,7 @@ class _FakeModels:
         self.script = script  # {model_name: [str|Exception, ...]} kolejno per wywołanie
         self.calls = calls
 
-    def generate_content(self, model, contents):
+    def generate_content(self, model, contents, **kwargs):
         self.calls.append(model)
         outcomes = self.script.get(model, [])
         idx = sum(1 for c in self.calls if c == model) - 1
@@ -412,29 +412,29 @@ def gemini_env(monkeypatch):
 
 def test_gemini_chain_falls_through_on_503(gemini_env):
     calls, sleeps = gemini_env({
-        "gemini-3.5-flash": [Exception(_OVERLOAD_MSG), Exception(_OVERLOAD_MSG)],
-        "gemini-3-flash-preview": ["RAPORT Z 3-FLASH"],
+        "gemini-3.8-flash": [Exception(_OVERLOAD_MSG), Exception(_OVERLOAD_MSG)],
+        "gemini-3.7-flash": ["RAPORT Z 3.7"],
     })
     result = layout_v2._call_gemini_v2("prompt", "key")
-    assert result == "RAPORT Z 3-FLASH"
-    # dwie próby modelu podstawowego, potem sukces zapasowego
-    assert calls == ["gemini-3.5-flash", "gemini-3.5-flash", "gemini-3-flash-preview"]
+    assert result == "RAPORT Z 3.7"
+    assert calls == ["gemini-3.8-flash", "gemini-3.8-flash", "gemini-3.7-flash"]
     assert 10 in sleeps  # backoff między próbami modelu podstawowego
 
 
-def test_gemini_total_timeout_is_three_minutes(gemini_env):
-    gemini_env({"gemini-3.5-flash": ["RAPORT"]})
+def test_gemini_attempt_timeout_is_capped(gemini_env):
+    gemini_env({"gemini-3.8-flash": ["RAPORT"]})
 
     layout_v2._call_gemini_v2("prompt", "key")
 
-    assert 179_000 <= layout_v2.genai.http_options.timeout <= 180_000
+    assert layout_v2.genai.http_options.timeout <= layout_v2.GEMINI_ATTEMPT_TIMEOUT_SECONDS * 1000
+    assert layout_v2.genai.http_options.timeout >= 1
 
 
 def test_gemini_hard_timeout_returns_control(monkeypatch):
     release_request = threading.Event()
 
     class BlockingModels:
-        def generate_content(self, model, contents):
+        def generate_content(self, model, contents, **kwargs):
             release_request.wait()
             return type("R", (), {"text": "ZA PÓŹNO"})()
 
@@ -457,36 +457,49 @@ def test_gemini_hard_timeout_returns_control(monkeypatch):
 
 def test_gemini_chain_skips_daily_quota_fast(gemini_env):
     calls, sleeps = gemini_env({
-        "gemini-3.5-flash": [Exception(_DAILY_QUOTA_MSG)],
-        "gemini-3-flash-preview": [Exception(_DAILY_QUOTA_MSG)],
-        "gemini-2.5-flash": ["RAPORT Z 2.5"],
+        "gemini-3.8-flash": [Exception(_DAILY_QUOTA_MSG)],
+        "gemini-3.7-flash": [Exception(_DAILY_QUOTA_MSG)],
+        "gemini-3.5-flash": ["RAPORT Z 3.5"],
     })
     result = layout_v2._call_gemini_v2("prompt", "key")
-    assert result == "RAPORT Z 2.5"
-    # każdy wyczerpany model wołany raz (break bez drugiej próby), zero długiego sleepu
-    assert calls == ["gemini-3.5-flash", "gemini-3-flash-preview", "gemini-2.5-flash"]
+    assert result == "RAPORT Z 3.5"
+    assert calls == ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash"]
     assert sleeps == []
+
+
+def test_gemini_504_retries_then_fallback(gemini_env):
+    deadline = Exception("504 DEADLINE_EXCEEDED. Deadline expired before operation could complete.")
+    calls, sleeps = gemini_env({
+        "gemini-3.8-flash": [deadline, deadline],
+        "gemini-3.7-flash": ["RAPORT Z 3.7"],
+    })
+    result = layout_v2._call_gemini_v2("prompt", "key")
+    assert result == "RAPORT Z 3.7"
+    assert calls == ["gemini-3.8-flash", "gemini-3.8-flash", "gemini-3.7-flash"]
+    assert 10 in sleeps
 
 
 def test_gemini_chain_all_fail_raises(gemini_env):
     gemini_env({
+        "gemini-3.8-flash": [Exception(_OVERLOAD_MSG), Exception(_OVERLOAD_MSG)],
+        "gemini-3.7-flash": [Exception(_OVERLOAD_MSG), Exception(_OVERLOAD_MSG)],
         "gemini-3.5-flash": [Exception(_OVERLOAD_MSG), Exception(_OVERLOAD_MSG)],
-        "gemini-3-flash-preview": [Exception(_OVERLOAD_MSG), Exception(_OVERLOAD_MSG)],
-        "gemini-2.5-flash": [Exception(_OVERLOAD_MSG), Exception(_OVERLOAD_MSG)],
     })
     with pytest.raises(Exception):
         layout_v2._call_gemini_v2("prompt", "key")
 
 
 def test_build_model_chain_dedup_with_env(monkeypatch):
-    monkeypatch.setenv("GEMINI_MODEL", "gemini-3-flash-preview")
-    assert layout_v2._build_model_chain() == ["gemini-3-flash-preview", "gemini-2.5-flash"]
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-3.7-flash")
+    assert layout_v2._build_model_chain() == [
+        "gemini-3.7-flash", "gemini-3.8-flash", "gemini-3.5-flash",
+    ]
 
 
 def test_build_model_chain_default(monkeypatch):
     monkeypatch.delenv("GEMINI_MODEL", raising=False)
     assert layout_v2._build_model_chain() == [
-        "gemini-3.5-flash", "gemini-3-flash-preview", "gemini-2.5-flash",
+        "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash",
     ]
 
 

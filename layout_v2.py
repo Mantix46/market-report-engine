@@ -20,22 +20,12 @@ v2 prowadzi sobotni tracker prognoz: rozlicza poprzedni horyzont przed promptem
 Gemini i zapisuje zarówno benchmark techniczny, jak i prognozę wieloczynnikową AI.
 """
 
-import os
 import json
-import time
 import logging
-import queue
-import threading
 from datetime import datetime, timedelta
 from typing import Optional
 
-try:
-    from google import genai
-    from google.genai import types as genai_types
-except ImportError:
-    genai = None
-    genai_types = None
-
+from gemini_client import call_gemini
 from data_fetching import (
     US_TICKERS, GPW_TICKERS_MAP, TICKER_NAMES, TICKER_NOTES,
     get_index_tickers_v2, fetch_period_change, fetch_analyst_recommendations,
@@ -402,175 +392,13 @@ def _sentiment_data_block(data: dict) -> str:
 
 
 # ============================================================
-# Renderer AI (Gemini) z exponential backoff
+# Renderer AI — HTTP i łańcuch modeli w gemini_client.py
 # ============================================================
 
-# Łańcuch modeli zapasowych: gdy podstawowy padnie (503 / 504 / quota),
-# próbujemy kolejnych — każdy ma OSOBNĄ pulę limitów.
-GEMINI_DEFAULT_MODEL = "gemini-3.8-flash"
-GEMINI_FALLBACK_CHAIN = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash"]
-
-# Próby per model: backoff w sekundach (pierwsza natychmiast, druga po 10s).
-GEMINI_MODEL_BACKOFF = [0, 10]
-
-# Łączny budżet czasu dla całej fazy Gemini (retry + zapasowe modele).
-GEMINI_TIMEOUT_SECONDS = 360
-# Twardy limit JEDNEJ próby — nie może zjeść całego budżetu, inaczej
-# łańcuch zapasowy nigdy nie wystartuje (jak 03.09.2026: 504 po 179s).
-GEMINI_ATTEMPT_TIMEOUT_SECONDS = 75
-
-
-def _build_model_chain() -> list[str]:
-    """Podstawowy model (GEMINI_MODEL lub gemini-3.8-flash) + zapasowe,
-    zdeduplikowane z zachowaniem kolejności."""
-    primary = os.getenv("GEMINI_MODEL") or GEMINI_DEFAULT_MODEL
-    chain = []
-    for model in [primary] + GEMINI_FALLBACK_CHAIN:
-        if model not in chain:
-            chain.append(model)
-    return chain
-
-
-def _generate_content_config():
-    """Wyłącza AFC — inaczej SDK woła narzędzia (max 10 remote calls) i request
-    wisi aż do 504 zamiast zwrócić sam tekst raportu."""
-    if genai_types is None:
-        return None
-    afc = getattr(genai_types, "AutomaticFunctionCallingConfig", None)
-    cfg_cls = getattr(genai_types, "GenerateContentConfig", None)
-    if afc is None or cfg_cls is None:
-        return None
-    return cfg_cls(automatic_function_calling=afc(disable=True))
-
-
-def _is_daily_quota_error(err_text: str) -> bool:
-    """Rozpoznaje wyczerpaną DOBOWĄ quotę (czekanie nie pomoże — trzeba zmienić model)."""
-    t = err_text.lower()
-    return ("resource_exhausted" in t or "429" in t) and (
-        "perday" in t or "per day" in t or "limit: 0" in t
-    )
-
-
-def _generate_content_with_timeout(
-    prompt: str,
-    api_key: str,
-    model_name: str,
-    timeout_seconds: float,
-):
-    """Wykonuje jedno żądanie Gemini z twardym limitem czasu.
-
-    Timeout biblioteki jest przekazywany również do serwera, ale na Windowsie
-    zerwane lub zawieszone połączenie nie zawsze kończy się punktualnie. Osobny
-    wątek daemon gwarantuje, że sterowanie wróci po wykorzystaniu pozostałego
-    budżetu czasu.
-    """
-    result_queue = queue.Queue(maxsize=1)
-    timeout_ms = max(1, int(timeout_seconds * 1000))
-
-    def run_request():
-        client = None
-        try:
-            client = genai.Client(
-                api_key=api_key,
-                http_options=genai_types.HttpOptions(
-                    timeout=timeout_ms,
-                ),
-            )
-            kwargs = {
-                "model": model_name,
-                "contents": prompt,
-            }
-            config = _generate_content_config()
-            if config is not None:
-                kwargs["config"] = config
-            response = client.models.generate_content(**kwargs)
-            result_queue.put((True, response))
-        except BaseException as exc:
-            result_queue.put((False, exc))
-        finally:
-            close = getattr(client, "close", None)
-            if close:
-                close()
-
-    request_thread = threading.Thread(
-        target=run_request,
-        name=f"gemini-{model_name}",
-        daemon=True,
-    )
-    request_thread.start()
-    request_thread.join(timeout_seconds)
-
-    if request_thread.is_alive():
-        raise TimeoutError(
-            f"Przekroczono pozostały limit {timeout_seconds:.0f}s "
-            f"dla modelu {model_name}."
-        )
-
-    succeeded, result = result_queue.get_nowait()
-    if succeeded:
-        return result
-    raise result
-
-
 def _call_gemini_v2(prompt: str, api_key: str) -> str:
-    """Wywołanie Gemini z łańcuchem modeli zapasowych.
-
-    Dla każdego modelu (gemini-3.8-flash -> gemini-3.7-flash -> gemini-3.5-flash)
-    do 2 prób z backoffem 0/10s. Wyczerpana DOBOWA quota danego modelu → od razu
-    następny model (czekanie nic nie da). 503/504/limit per-minute → druga próba,
-    potem następny model. Jedna próba ma własny limit (75s), żeby 504 nie spalił
-    całego budżetu. Po wyczerpaniu łańcucha rzuca wyjątek (fallback regułowy
-    przejmuje w report_builder.build_report)."""
-    chain = _build_model_chain()
-    deadline = time.monotonic() + GEMINI_TIMEOUT_SECONDS
-    logger.info(f"Layout v2 — łańcuch modeli Gemini: {' -> '.join(chain)}")
-    logger.info(
-        f"Layout v2 — łączny timeout Gemini: {GEMINI_TIMEOUT_SECONDS}s "
-        f"(max {GEMINI_ATTEMPT_TIMEOUT_SECONDS}s na próbę)."
-    )
-
-    last_error: Optional[Exception] = None
-    for model_name in chain:
-        for attempt, delay in enumerate(GEMINI_MODEL_BACKOFF, start=1):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(
-                    f"Przekroczono łączny limit {GEMINI_TIMEOUT_SECONDS}s dla Gemini."
-                ) from last_error
-            if delay:
-                if delay >= remaining:
-                    raise TimeoutError(
-                        f"Przekroczono łączny limit {GEMINI_TIMEOUT_SECONDS}s dla Gemini."
-                    ) from last_error
-                logger.info(f"Layout v2 — [{model_name}] czekam {delay}s przed próbą {attempt}...")
-                time.sleep(delay)
-                remaining = deadline - time.monotonic()
-            try:
-                logger.info(
-                    f"Layout v2 — [{model_name}] próba {attempt}/{len(GEMINI_MODEL_BACKOFF)} "
-                    f"zapytania do Gemini..."
-                )
-                attempt_timeout = min(remaining, float(GEMINI_ATTEMPT_TIMEOUT_SECONDS))
-                response = _generate_content_with_timeout(
-                    prompt,
-                    api_key,
-                    model_name,
-                    attempt_timeout,
-                )
-                if not response.text:
-                    raise Exception("Pusta odpowiedź z Gemini.")
-                logger.info(f"Layout v2 — odpowiedź z modelu {model_name}.")
-                return response.text
-            except Exception as e:
-                last_error = e
-                logger.warning(f"Layout v2 — [{model_name}] próba {attempt} nieudana: {e}")
-                if _is_daily_quota_error(str(e)):
-                    logger.info(
-                        f"Layout v2 — [{model_name}] wyczerpana dobowa quota, "
-                        f"przechodzę do kolejnego modelu."
-                    )
-                    break
-    raise last_error or Exception("Gemini v2: wszystkie modele nieudane")
+    """Zwraca tekst Gemini. Wyjątek łapie report_builder i składa raport regułowy."""
+    text, _model_name = call_gemini(prompt, api_key)
+    return text
 
 
 def _parse_ai_sections(text: str, headers: Optional[list] = None) -> dict:

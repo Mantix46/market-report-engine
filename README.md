@@ -69,7 +69,7 @@ RECIPIENT_EMAIL=adres_odbiorcy@example.com
 REPORT_TIME=07:30
 
 GEMINI_API_KEY=twoj_klucz
-GEMINI_MODEL=gemini-3.5-flash
+GEMINI_MODEL=gemini-3.8-flash
 
 FRED_API_KEY=
 FMP_API_KEY=

@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import os
 import queue
+import random
 import threading
 import time
 from typing import Optional
@@ -40,6 +41,11 @@ GEMINI_ATTEMPT_TIMEOUTS = {
 }
 GEMINI_PRIMARY_SWITCH_SECONDS = 60
 GEMINI_ATTEMPT_TIMEOUT_SECONDS = GEMINI_ATTEMPT_TIMEOUTS[GEMINI_DEFAULT_MODEL]
+# Backoff po błędach przejściowych (429/500/502/503/504) — kolejne odstępy w sekundach.
+GEMINI_RETRY_BACKOFF_SECONDS = (5, 15, 30)
+GEMINI_RETRY_JITTER = 0.2  # +0..20% losowo, żeby nie trafiać równo w szczyt obciążenia
+GEMINI_MIN_ATTEMPT_SECONDS = 5  # poniżej tego budżetu nie zaczynamy nowej próby
+GEMINI_MAX_ROUNDS = 3  # bezpiecznik: ile razy maksymalnie przejść cały łańcuch
 
 
 def build_model_chain() -> list[str]:
@@ -65,6 +71,32 @@ def _is_slow_error(err: BaseException) -> bool:
         return True
     text = str(err).lower()
     return any(token in text for token in ("504", "deadline", "timeout", "timed out"))
+
+
+def _is_transient_error(err: BaseException) -> bool:
+    """429 (nie dobowa quota), 500, 502, 503, 504 — warto ponowić ten sam model."""
+    text = str(err).lower()
+    if _is_daily_quota_error(text):
+        return False
+    tokens = ("429", "500", "502", "503", "504", "unavailable", "overloaded",
+              "resource_exhausted", "internal", "bad gateway", "deadline")
+    return any(token in text for token in tokens)
+
+
+def _error_status(err: BaseException) -> str:
+    if isinstance(err, TimeoutError):
+        return "timeout"
+    code = getattr(err, "code", None) or getattr(err, "status_code", None)
+    if code:
+        return str(code)
+    head = str(err).split(" ", 1)[0].rstrip(".")
+    return head if head.isdigit() else type(err).__name__
+
+
+def _backoff_delay(retry_index: int) -> float:
+    steps = GEMINI_RETRY_BACKOFF_SECONDS
+    base = steps[min(retry_index, len(steps) - 1)]
+    return base * (1 + random.uniform(0, GEMINI_RETRY_JITTER))
 
 
 def _generate_content_config():
@@ -142,33 +174,17 @@ def _generate_content_with_timeout(
     raise result
 
 
-def _sleep_until(target: float, deadline: float) -> None:
-    """Dosypia do `target`, ale nie dalej niż do łącznego budżetu."""
-    delay = min(target, deadline) - time.monotonic()
-    if delay > 0:
-        logger.info(f"Gemini — czekam {delay:.0f}s przed kolejnym modelem...")
-        time.sleep(delay)
-
-
-def _budget_left(deadline: float, last_error: Optional[Exception]) -> float:
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise TimeoutError(
-            f"Przekroczono łączny limit {GEMINI_TIMEOUT_SECONDS}s dla Gemini."
-        ) from last_error
-    return remaining
-
-
 def call_gemini(prompt: str, api_key: str) -> tuple[str, str]:
     """Wywołanie Gemini z łańcuchem modeli zapasowych.
 
-    Zwraca (tekst, nazwa_modelu). Po wyczerpaniu łańcucha rzuca wyjątek.
+    Zwraca (tekst, nazwa_modelu). Po wyczerpaniu budżetu rzuca wyjątek
+    (report_builder składa wtedy raport regułowy).
 
-    gemini-3.8-flash ma jedną próbę (60 s). Jeśli nie zwróci tekstu, 3.5 startuje
-    60 s po początku tej próby — wcześniejszy 503 nie przeskakuje od razu.
-    Dobowa quota przeskakuje model bez czekania. gemini-3.5-flash ma drugą próbę
-    tylko po timeoutcie albo 504. Przy 503 idzie dalej. gemini-3.7-flash to jedna
-    krótka próba na końcu.
+    Każdy model: błędy przejściowe (429/500/502/503/504) są ponawiane z backoffem
+    5/15/30 s + jitter, ograniczonym pozostałym budżetem. Timeout klienta ponawia
+    tylko gemini-3.5-flash (inne modele od razu ustępują miejsca kolejnemu).
+    Dobowa quota i błędy trwałe (np. 400) wykluczają model. Łańcuch jest
+    przechodzony w kolejnych rundach (max GEMINI_MAX_ROUNDS), dopóki starcza budżetu.
     """
     chain = build_model_chain()
     deadline = time.monotonic() + GEMINI_TIMEOUT_SECONDS
@@ -177,47 +193,73 @@ def call_gemini(prompt: str, api_key: str) -> tuple[str, str]:
         f"{model.split('-')[1]} {secs}s" for model, secs in GEMINI_ATTEMPT_TIMEOUTS.items()
     )
     logger.info(
-        f"Gemini — łączny timeout: {GEMINI_TIMEOUT_SECONDS}s (limity prób: {limits})."
+        f"Gemini — łączny timeout: {GEMINI_TIMEOUT_SECONDS}s (limity prób: {limits}, "
+        f"backoff: {'/'.join(str(b) for b in GEMINI_RETRY_BACKOFF_SECONDS)}s + jitter)."
     )
+    max_attempts = len(GEMINI_RETRY_BACKOFF_SECONDS) + 1
 
     last_error: Optional[Exception] = None
-    for index, model_name in enumerate(chain):
-        _budget_left(deadline, last_error)
-        max_attempts = 2 if model_name == "gemini-3.5-flash" else 1
-        for attempt in range(1, max_attempts + 1):
-            remaining = _budget_left(deadline, last_error)
-            started = time.monotonic()
-            try:
-                logger.info(
-                    f"Gemini — [{model_name}] próba {attempt}/{max_attempts}..."
-                )
-                response = _generate_content_with_timeout(
-                    prompt,
-                    api_key,
-                    model_name,
-                    min(remaining, _attempt_limit(model_name)),
-                )
-                if not response.text:
-                    raise Exception("Pusta odpowiedź z Gemini.")
-                logger.info(f"Gemini — odpowiedź z modelu {model_name}.")
-                return response.text, model_name
-            except Exception as e:
-                last_error = e
-                logger.warning(f"Gemini — [{model_name}] próba {attempt} nieudana: {e}")
-                if _is_daily_quota_error(str(e)):
+    excluded: set[str] = set()
+    for round_no in range(1, GEMINI_MAX_ROUNDS + 1):
+        active = [m for m in chain if m not in excluded]
+        if not active:
+            break
+        for model_name in active:
+            attempt = 0
+            while attempt < max_attempts:
+                remaining = deadline - time.monotonic()
+                if remaining < GEMINI_MIN_ATTEMPT_SECONDS:
+                    raise TimeoutError(
+                        f"Przekroczono łączny limit {GEMINI_TIMEOUT_SECONDS}s dla Gemini."
+                    ) from last_error
+                attempt += 1
+                try:
                     logger.info(
-                        f"Gemini — [{model_name}] wyczerpana dobowa quota, "
-                        "przechodzę do kolejnego modelu."
+                        f"Gemini — [{model_name}] runda {round_no}, próba "
+                        f"{attempt}/{max_attempts} (budżet {remaining:.0f}s)..."
                     )
-                    break
-                if (
-                    model_name == "gemini-3.5-flash"
-                    and attempt < max_attempts
-                    and _is_slow_error(e)
-                ):
-                    continue
-                next_model = chain[index + 1] if index + 1 < len(chain) else None
-                if model_name == "gemini-3.8-flash" and next_model == "gemini-3.5-flash":
-                    _sleep_until(started + GEMINI_PRIMARY_SWITCH_SECONDS, deadline)
-                break
+                    response = _generate_content_with_timeout(
+                        prompt, api_key, model_name,
+                        min(remaining, _attempt_limit(model_name)),
+                    )
+                    if not response.text:
+                        raise Exception("Pusta odpowiedź z Gemini.")
+                    logger.info(f"Gemini — odpowiedź z modelu {model_name} (próba {attempt}).")
+                    return response.text, model_name
+                except Exception as e:
+                    last_error = e
+                    status = _error_status(e)
+                    logger.warning(
+                        f"Gemini — [{model_name}] próba {attempt} nieudana "
+                        f"(status: {status}): {e}"
+                    )
+                    if _is_daily_quota_error(str(e)):
+                        logger.info(f"Gemini — [{model_name}] dobowa quota, wykluczam model.")
+                        excluded.add(model_name)
+                        break
+                    if isinstance(e, TimeoutError):
+                        if model_name == "gemini-3.5-flash" and attempt < 2:
+                            continue
+                        logger.info(f"Gemini — [{model_name}] timeout, przechodzę dalej.")
+                        break
+                    if not _is_transient_error(e):
+                        logger.info(f"Gemini — [{model_name}] błąd trwały, wykluczam model.")
+                        excluded.add(model_name)
+                        break
+                    if attempt >= max_attempts:
+                        logger.info(f"Gemini — [{model_name}] limit prób, przechodzę dalej.")
+                        break
+                    delay = _backoff_delay(attempt - 1)
+                    left = deadline - time.monotonic()
+                    if delay + GEMINI_MIN_ATTEMPT_SECONDS > left:
+                        logger.info(
+                            f"Gemini — [{model_name}] backoff {delay:.0f}s nie mieści się "
+                            f"w budżecie ({left:.0f}s), przechodzę dalej."
+                        )
+                        break
+                    logger.info(
+                        f"Gemini — [{model_name}] status {status}, czekam {delay:.1f}s "
+                        f"przed próbą {attempt + 1}/{max_attempts}."
+                    )
+                    time.sleep(delay)
     raise last_error or Exception("Gemini: wszystkie modele nieudane")

@@ -108,6 +108,7 @@ TICKER_NAMES = {
     "BFT.WA": "Benefit Systems",
     "PEO.WA": "Bank Pekao",
     "NBIS": "Nebius Group",
+    "AVGO": "Broadcom Inc.",
     "AMKR": "Amkor Technology",
     "ASYS": "Amtech Systems",
 }

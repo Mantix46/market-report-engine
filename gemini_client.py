@@ -44,7 +44,14 @@ GEMINI_ATTEMPT_TIMEOUT_SECONDS = GEMINI_ATTEMPT_TIMEOUTS[GEMINI_DEFAULT_MODEL]
 # Backoff po błędach przejściowych (429/500/502/503/504) — kolejne odstępy w sekundach.
 GEMINI_RETRY_BACKOFF_SECONDS = (5, 15, 30)
 GEMINI_RETRY_JITTER = 0.2  # +0..20% losowo, żeby nie trafiać równo w szczyt obciążenia
-GEMINI_MIN_ATTEMPT_SECONDS = 5  # poniżej tego budżetu nie zaczynamy nowej próby
+# API odrzuca deadline < 10 s (400 "deadline ... too short, minimum 10s"), więc przy
+# mniejszym budżecie próby nie wysyłamy wcale.
+GEMINI_MIN_ATTEMPT_SECONDS = 10
+# Limit prób na model w całym wywołaniu (wszystkie rundy). 3.8: jedna próba —
+# 503/504 od razu oddaje budżet kolejnemu modelowi. Pozostałe: domyślny limit z backoffu.
+GEMINI_MAX_ATTEMPTS_PER_MODEL = {
+    "gemini-3.8-flash": 1,
+}
 GEMINI_MAX_ROUNDS = 3  # bezpiecznik: ile razy maksymalnie przejść cały łańcuch
 
 
@@ -63,6 +70,11 @@ def build_model_chain() -> list[str]:
 
 def _attempt_limit(model_name: str) -> float:
     return float(GEMINI_ATTEMPT_TIMEOUTS.get(model_name, GEMINI_PRIMARY_SWITCH_SECONDS))
+
+
+def _max_attempts(model_name: str) -> int:
+    default = len(GEMINI_RETRY_BACKOFF_SECONDS) + 1
+    return GEMINI_MAX_ATTEMPTS_PER_MODEL.get(model_name, default)
 
 
 def _is_slow_error(err: BaseException) -> bool:
@@ -181,8 +193,11 @@ def call_gemini(prompt: str, api_key: str) -> tuple[str, str]:
     (report_builder składa wtedy raport regułowy).
 
     Każdy model: błędy przejściowe (429/500/502/503/504) są ponawiane z backoffem
-    5/15/30 s + jitter, ograniczonym pozostałym budżetem. Timeout klienta ponawia
-    tylko gemini-3.5-flash (inne modele od razu ustępują miejsca kolejnemu).
+    5/15/30 s + jitter, ograniczonym pozostałym budżetem — poza modelami
+    z GEMINI_MAX_ATTEMPTS_PER_MODEL (3.8: jedna próba łącznie, potem kolejny model).
+    Próba nie jest wysyłana, gdy budżet < GEMINI_MIN_ATTEMPT_SECONDS (minimum API).
+    Timeout klienta ponawia tylko gemini-3.5-flash (inne modele od razu ustępują
+    miejsca kolejnemu).
     Dobowa quota i błędy trwałe (np. 400) wykluczają model. Łańcuch jest
     przechodzony w kolejnych rundach (max GEMINI_MAX_ROUNDS), dopóki starcza budżetu.
     """
@@ -196,15 +211,18 @@ def call_gemini(prompt: str, api_key: str) -> tuple[str, str]:
         f"Gemini — łączny timeout: {GEMINI_TIMEOUT_SECONDS}s (limity prób: {limits}, "
         f"backoff: {'/'.join(str(b) for b in GEMINI_RETRY_BACKOFF_SECONDS)}s + jitter)."
     )
-    max_attempts = len(GEMINI_RETRY_BACKOFF_SECONDS) + 1
-
     last_error: Optional[Exception] = None
     excluded: set[str] = set()
+    attempts_total: dict[str, int] = {}
     for round_no in range(1, GEMINI_MAX_ROUNDS + 1):
         active = [m for m in chain if m not in excluded]
         if not active:
             break
         for model_name in active:
+            max_attempts = _max_attempts(model_name)
+            capped = model_name in GEMINI_MAX_ATTEMPTS_PER_MODEL
+            if capped and attempts_total.get(model_name, 0) >= max_attempts:
+                continue
             attempt = 0
             while attempt < max_attempts:
                 remaining = deadline - time.monotonic()
@@ -213,14 +231,18 @@ def call_gemini(prompt: str, api_key: str) -> tuple[str, str]:
                         f"Przekroczono łączny limit {GEMINI_TIMEOUT_SECONDS}s dla Gemini."
                     ) from last_error
                 attempt += 1
+                attempts_total[model_name] = attempts_total.get(model_name, 0) + 1
+                # Nigdy poniżej minimum API (remaining >= minimum, więc mieści się w budżecie).
+                attempt_timeout = max(
+                    GEMINI_MIN_ATTEMPT_SECONDS, min(remaining, _attempt_limit(model_name))
+                )
                 try:
                     logger.info(
                         f"Gemini — [{model_name}] runda {round_no}, próba "
                         f"{attempt}/{max_attempts} (budżet {remaining:.0f}s)..."
                     )
                     response = _generate_content_with_timeout(
-                        prompt, api_key, model_name,
-                        min(remaining, _attempt_limit(model_name)),
+                        prompt, api_key, model_name, attempt_timeout,
                     )
                     if not response.text:
                         raise Exception("Pusta odpowiedź z Gemini.")

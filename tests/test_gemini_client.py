@@ -179,11 +179,12 @@ def test_is_daily_quota_error():
 
 def test_503_retries_same_model_with_backoff_then_success(gemini_env):
     calls, sleeps, _fake = gemini_env({
-        "gemini-3.8-flash": [Exception(_OVERLOAD_MSG), Exception(_OVERLOAD_MSG), "RAPORT Z 3.8"],
+        "gemini-3.8-flash": [Exception(_OVERLOAD_MSG)],
+        "gemini-3.5-flash": [Exception(_OVERLOAD_MSG), Exception(_OVERLOAD_MSG), "RAPORT Z 3.5"],
     })
     text, model = gemini_client.call_gemini("prompt", "key")
-    assert text == "RAPORT Z 3.8" and model == "gemini-3.8-flash"
-    assert calls == ["gemini-3.8-flash"] * 3
+    assert text == "RAPORT Z 3.5" and model == "gemini-3.5-flash"
+    assert calls == ["gemini-3.8-flash"] + ["gemini-3.5-flash"] * 3
     assert sleeps == [5, 15]
 
 
@@ -194,19 +195,26 @@ def test_503_retries_same_model_with_backoff_then_success(gemini_env):
     "504 DEADLINE_EXCEEDED. Deadline expired.",
 ])
 def test_other_transient_errors_are_retried(gemini_env, msg):
-    calls, sleeps, _fake = gemini_env({"gemini-3.8-flash": [Exception(msg), "OK"]})
-    assert gemini_client.call_gemini("prompt", "key") == ("OK", "gemini-3.8-flash")
+    calls, sleeps, _fake = gemini_env({
+        "gemini-3.8-flash": [Exception(msg)],
+        "gemini-3.5-flash": [Exception(msg), "OK"],
+    })
+    assert gemini_client.call_gemini("prompt", "key") == ("OK", "gemini-3.5-flash")
+    assert calls == ["gemini-3.8-flash"] + ["gemini-3.5-flash"] * 2
     assert sleeps == [5]
 
 
 def test_503_exhausts_attempts_then_next_model(gemini_env):
     calls, sleeps, _fake = gemini_env({
-        "gemini-3.8-flash": [Exception(_OVERLOAD_MSG)] * 4,
-        "gemini-3.5-flash": [Exception(_OVERLOAD_MSG), "RAPORT Z 3.5"],
+        "gemini-3.8-flash": [Exception(_OVERLOAD_MSG)],
+        "gemini-3.5-flash": [Exception(_OVERLOAD_MSG)] * 4,
+        "gemini-3.7-flash": [Exception(_OVERLOAD_MSG), "RAPORT Z 3.7"],
     })
     text, model = gemini_client.call_gemini("prompt", "key")
-    assert model == "gemini-3.5-flash"
-    assert calls == ["gemini-3.8-flash"] * 4 + ["gemini-3.5-flash"] * 2
+    assert model == "gemini-3.7-flash"
+    assert calls == (
+        ["gemini-3.8-flash"] + ["gemini-3.5-flash"] * 4 + ["gemini-3.7-flash"] * 2
+    )
     assert sleeps == [5, 15, 30, 5]
 
 
@@ -263,3 +271,87 @@ def test_backoff_has_jitter_bounded():
         assert base <= d <= base * (1 + gemini_client.GEMINI_RETRY_JITTER)
     assert gemini_client._is_transient_error(Exception(_OVERLOAD_MSG))
     assert not gemini_client._is_transient_error(Exception(_DAILY_QUOTA_MSG))
+
+
+# --- Runy #66/#67/#69: 3.8 zjadała budżet retry'ami, runda 2 dostawała 400 za krótki deadline.
+
+def _fake_clock(monkeypatch):
+    clock = {"t": 0.0}
+    monkeypatch.setattr(gemini_client.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(
+        gemini_client.time, "sleep", lambda seconds: clock.__setitem__("t", clock["t"] + seconds)
+    )
+    monkeypatch.setattr(gemini_client.random, "uniform", lambda a, b: 0.0)
+    monkeypatch.delenv("GEMINI_MODEL", raising=False)
+    monkeypatch.setattr(gemini_client, "genai_types", _Types)
+    return clock
+
+
+@pytest.mark.parametrize("msg", [
+    "504 DEADLINE_EXCEEDED. Deadline expired.",
+    _OVERLOAD_MSG,
+])
+def test_38_single_attempt_on_503_504_then_next_model(gemini_env, msg):
+    calls, sleeps, _fake = gemini_env({
+        "gemini-3.8-flash": [Exception(msg), "NIE POWINNO BYC WYWOLANE"],
+        "gemini-3.5-flash": ["RAPORT Z 3.5"],
+    })
+    assert gemini_client.call_gemini("prompt", "key") == ("RAPORT Z 3.5", "gemini-3.5-flash")
+    assert calls == ["gemini-3.8-flash", "gemini-3.5-flash"]
+    assert sleeps == []
+
+
+def test_38_not_retried_in_later_rounds(monkeypatch):
+    clock = _fake_clock(monkeypatch)
+    calls = []
+
+    def fake_generate(prompt, api_key, model_name, timeout_seconds):
+        calls.append(model_name)
+        clock["t"] += 1
+        raise Exception("504 DEADLINE_EXCEEDED. Deadline expired.")
+
+    monkeypatch.setattr(gemini_client, "_generate_content_with_timeout", fake_generate)
+    with pytest.raises(Exception):
+        gemini_client.call_gemini("prompt", "key")
+    assert calls.count("gemini-3.8-flash") == 1
+    assert calls[0] == "gemini-3.8-flash"
+    assert calls.count("gemini-3.5-flash") > 1
+
+
+def test_no_call_when_budget_below_minimum_and_deadline_never_below_10s(monkeypatch):
+    clock = _fake_clock(monkeypatch)
+    sent = []  # (model, budżet w chwili wysłania, deadline przekazany do API)
+
+    def fake_generate(prompt, api_key, model_name, timeout_seconds):
+        remaining = gemini_client.GEMINI_TIMEOUT_SECONDS - clock["t"]
+        sent.append((model_name, remaining, timeout_seconds))
+        # Każda próba zjada cały swój limit — budżet kończy się "w połowie" próby.
+        clock["t"] += timeout_seconds
+        raise TimeoutError("limit")
+
+    monkeypatch.setattr(gemini_client, "_generate_content_with_timeout", fake_generate)
+    with pytest.raises(TimeoutError, match="łączny limit"):
+        gemini_client.call_gemini("prompt", "key")
+    assert gemini_client.GEMINI_MIN_ATTEMPT_SECONDS == 10
+    assert sent
+    for _model, remaining, timeout in sent:
+        assert remaining >= 10
+        assert 10 <= timeout <= remaining
+    assert clock["t"] <= gemini_client.GEMINI_TIMEOUT_SECONDS
+
+
+def test_small_leftover_budget_skips_attempt(monkeypatch):
+    """Zostaje 6 s budżetu (jak w runie #69) — próba nie idzie do API."""
+    clock = _fake_clock(monkeypatch)
+    calls = []
+
+    def fake_generate(prompt, api_key, model_name, timeout_seconds):
+        calls.append((model_name, timeout_seconds))
+        clock["t"] = gemini_client.GEMINI_TIMEOUT_SECONDS - 6
+        raise TimeoutError("limit")
+
+    monkeypatch.setattr(gemini_client, "_generate_content_with_timeout", fake_generate)
+    with pytest.raises(TimeoutError, match="łączny limit"):
+        gemini_client.call_gemini("prompt", "key")
+    assert calls == [("gemini-3.8-flash", 60.0)]
+

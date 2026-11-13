@@ -22,19 +22,24 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-GEMINI_DEFAULT_MODEL = "gemini-3.8-flash"
-# Główny model, potem ten, który realnie kończy raport, na końcu krótka próba.
+GEMINI_DEFAULT_MODEL = "gemini-4-hydrogen"
+# Główny model, potem 3.8, potem 3.5, na końcu krótka próba 3.7.
 GEMINI_MODEL_CHAIN = [
+    "gemini-4-hydrogen",
     "gemini-3.8-flash",
     "gemini-3.5-flash",
     "gemini-3.7-flash",
 ]
 GEMINI_FALLBACK_CHAIN = GEMINI_MODEL_CHAIN[1:]
 GEMINI_TIMEOUT_SECONDS = 360
-# 3.8: jedna próba i przejście na 3.5 po 60 s od jej startu.
+# Hydrogen: jedna próba 240 s (domyślny thinking_level=high jest wolniejszy niż 3.8).
+# Łączny budżet 360 s zostaje: 240 + 60 (3.8) + reszta na 3.5/3.7.
+# Druga próba Hydrogen (kolejne 240 s) nie mieściłaby się w tym budżecie.
+# 3.8: jedna próba i przejście dalej po 60 s od jej startu.
 # 3.5: 180 s, bo limit 75 s kończył się 504 po stronie Google.
 # 3.7: ostatnia krótka próba, gdy 3.5 też nie odpowie.
 GEMINI_ATTEMPT_TIMEOUTS = {
+    "gemini-4-hydrogen": 240,
     "gemini-3.8-flash": 60,
     "gemini-3.5-flash": 180,
     "gemini-3.7-flash": 20,
@@ -47,16 +52,18 @@ GEMINI_RETRY_JITTER = 0.2  # +0..20% losowo, żeby nie trafiać równo w szczyt 
 # API odrzuca deadline < 10 s (400 "deadline ... too short, minimum 10s"), więc przy
 # mniejszym budżecie próby nie wysyłamy wcale.
 GEMINI_MIN_ATTEMPT_SECONDS = 10
-# Limit prób na model w całym wywołaniu (wszystkie rundy). 3.8: jedna próba —
-# 503/504 od razu oddaje budżet kolejnemu modelowi. Pozostałe: domyślny limit z backoffu.
+# Limit prób na model w całym wywołaniu (wszystkie rundy). Hydrogen i 3.8:
+# jedna próba — 503/504 od razu oddaje budżet kolejnemu modelowi.
+# Pozostałe: domyślny limit z backoffu.
 GEMINI_MAX_ATTEMPTS_PER_MODEL = {
+    "gemini-4-hydrogen": 1,
     "gemini-3.8-flash": 1,
 }
 GEMINI_MAX_ROUNDS = 3  # bezpiecznik: ile razy maksymalnie przejść cały łańcuch
 
 
 def build_model_chain() -> list[str]:
-    """Podstawowy model (GEMINI_MODEL lub gemini-3.8-flash) + reszta łańcucha.
+    """Podstawowy model (GEMINI_MODEL lub gemini-4-hydrogen) + reszta łańcucha.
 
     Pusty GEMINI_MODEL (np. sekret Actions bez wartości) zostawia domyślną kolejność.
     """

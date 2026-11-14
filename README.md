@@ -12,6 +12,8 @@ Projekt służy do automatyzacji researchu rynkowego. Nie jest systemem transakc
 - kalendarz makroekonomiczny i kontekst rynkowy,
 - analiza treści przez Google Gemini z generatorem regułowym jako fallback,
 - sobotnia analiza trendu, prognozy i pomiar ich historycznej trafności,
+- codzienny przegląd formularzy SEC i osobne podsumowania publikacji wynikowych,
+- odczyty OFR Financial Stress Index i pozycjonowania funduszy z CFTC COT w sekcji sentymentu,
 - archiwizacja raportów i wysyłka przez SMTP,
 - uruchamianie lokalne, w schedulerze albo przez GitHub Actions.
 
@@ -109,6 +111,12 @@ python main.py --schedule
 
 Na Windows można też użyć `uruchom.bat --preview` albo `scheduler.bat`.
 
+Samo pobranie filingów do prywatnej kolejki, również w dni bez raportu:
+
+```powershell
+python main.py --sec-poll-only
+```
+
 ## Konfiguracja obserwowanych instrumentów
 
 Listy spółek, zapytania newsowe i notatki znajdują się w prywatnym, ignorowanym przez Git pliku `watchlists.json`. Szablon publiczny to `watchlists.example.json`. Najważniejsze pola:
@@ -120,6 +128,13 @@ Listy spółek, zapytania newsowe i notatki znajdują się w prywatnym, ignorowa
 - `RADAR_SMALLCAPS` — lista spółek obserwowanych przez radar.
 
 Zmiana list wpływa na zakres raportu, czas działania i liczbę zapytań do zewnętrznych źródeł.
+
+## SEC, wyniki i sentyment
+
+- `SEC_CONTACT_EMAIL` to adres kontaktowy wymagany do automatycznego dostępu SEC. Ustaw go w lokalnym `.env` oraz w Actions Secrets lub Variables. `SEC_TICKERS` jest opcjonalną listą oddzieloną przecinkami. Ustaw ją lokalnie lub w Actions Variables, np. `NBIS,MU,FPS,AAOI,AVGO`. Pusta wartość używa `US_TICKERS` z prywatnej watchlisty. [Zasady dostępu SEC](https://www.sec.gov/search-filings/edgar-search-assistance/accessing-edgar-data)
+- Sekcja **SEC EDGAR** pokazuje nowe formularze ze źródłowym linkiem, datą i opisem. Pierwsze uruchomienie obejmuje ostatnie siedem dni. Filingi złożone po porannym raporcie albo w dni bez wysyłki trafiają do następnego maila. Kolejka jest potwierdzana po akceptacji maila przez SMTP. Awaria zapisu stanu po udanej wysyłce może skutkować powtórzeniem pozycji.
+- Sekcja **Wyniki spółek** używa SEC Company Facts i oficjalnych dokumentów EDGAR, także załączników dla 6-K i 8-K. Wyniki mogą być częściowe, zwłaszcza gdy dokument zawiera nietypowe tabele lub nie podaje porównywalnych metryk. FMP może dostarczyć konsensus, jeśli posiadany klucz obejmuje odpowiednie endpointy. Zapasowym źródłem historycznego EPS jest istniejący `yfinance`. Porównanie wymaga zgodnego okresu, waluty i podstawy EPS. Szacunek przychodów porównywany z guidance musi dotyczyć tego samego przyszłego okresu i być zapisany przed ogłoszeniem. Każdy brak konsensusu jest oznaczony w raporcie. Gemini grupuje zweryfikowane fakty, a aplikacja wstawia liczby i źródła. [API SEC](https://www.sec.gov/search-filings/edgar-application-programming-interfaces) · [FMP Earnings](https://site.financialmodelingprep.com/developer/docs/stable/earnings-company) · [FMP Analyst Estimates](https://site.financialmodelingprep.com/developer/docs/stable/financial-estimates)
+- Sentyment obejmuje dzienny indeks stresu OFR z opóźnieniem dwóch dni roboczych i udział pozycji netto funduszy lewarowanych w kontraktach S&P 500 w open interest. Każdy odczyt ma datę, zmianę od poprzedniego i źródło. Niedostępność SEC lub jednego wskaźnika jest widoczna w logu i raporcie. [OFR](https://www.financialresearch.gov/financial-stress-index/) · [CFTC](https://publicreporting.cftc.gov/Commitments-of-Traders/TFF-Futures-Only/gpe5-46if)
 
 ## GitHub Actions
 
@@ -145,11 +160,14 @@ Sekrety opcjonalne:
 - `RECIPIENT_EMAIL` — domyślnie aplikacja używa wartości `SMTP_USER`,
 - `GEMINI_MODEL` — domyślnie aplikacja używa modelu skonfigurowanego w kodzie,
 - `FRED_API_KEY` — opcjonalnie,
-- `FMP_API_KEY` — opcjonalnie.
+- `FMP_API_KEY` — opcjonalnie,
+- `SEC_CONTACT_EMAIL` — wymagany tylko dla zapytań SEC. Może też być zmienną Actions.
 
 Sekrety GitHub Actions nie są zapisywane w kodzie. Nie wklejaj ich do workflow ani do `config.env.example`.
 
 Workflow pobiera `watchlists.json`, `daily_snapshots.csv` i `prediction_tracker.csv` z prywatnego repozytorium `Mantix46/market-report-state`. Po udanym raporcie zapisuje zaktualizowane CSV z powrotem do tego repo. Publiczne repo zawiera wyłącznie kod i przykładową konfigurację.
+
+Opcjonalne pliki prywatnego repo stanu `sec_edgar.json` i `earnings_consensus.json` powstają automatycznie. Workflow odtwarza je w lokalnym katalogu `state/`. Harmonogram GitHub Actions uruchamia wyłącznie odczyt SEC w niedziele i poniedziałki. Wysyłki nadal uruchamia istniejący `workflow_dispatch`.
 
 Prywatne repo stanu musi zawierać w katalogu głównym:
 
@@ -201,6 +219,10 @@ market_calendar.py      kalendarz sesji USA i GPW
 email_sender.py         wysyłka SMTP
 snapshot_store.py       historia dziennych snapshotów
 accuracy_tracker.py     zapis i ocena prognoz
+sec_edgar.py            pobieranie filingów SEC i prywatny stan dostarczenia
+earnings_report.py      odczyt i porównanie wyników oraz sekcja wynikowa
+guidance_consensus.py   prywatne migawki szacunków przed publikacją guidance
+market_sentiment.py     OFR Financial Stress Index i CFTC COT
 watchlists.example.json publiczny szablon obserwowanych instrumentów
 ```
 

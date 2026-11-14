@@ -13,7 +13,53 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  preview:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/probable_main_upgrade'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies and run tests
+        run: |
+          python -m pip install -r requirements.txt pytest
+          python -m pytest -q
+
+      - name: Generate report preview without SMTP
+        env:
+          SEC_CONTACT_EMAIL: ${{ secrets.SEC_CONTACT_EMAIL || vars.SEC_CONTACT_EMAIL }}
+          SEC_TICKERS: NBIS,MU,FPS,AAOI,AVGO
+        run: |
+          set -euo pipefail
+          cp watchlists.example.json watchlists.json
+          python main.py --preview > report-preview.md
+          for heading in '# RAPORT RYNKOWY' '## SEC EDGAR' '## 9. Sentyment' '## 10. Watchlist'; do
+            if ! grep -Fq "$heading" report-preview.md; then
+              echo "::error::Nie wygenerowano pełnego podglądu. Brakuje sekcji: $heading"
+              exit 1
+            fi
+          done
+          if [[ -z "$SEC_CONTACT_EMAIL" ]]; then
+            echo "::warning::Brak SEC_CONTACT_EMAIL. Podgląd sprawdził zachowanie bez dostępu do SEC."
+          fi
+
+      - name: Upload sample report
+        uses: actions/upload-artifact@v4
+        with:
+          name: market-report-preview
+          path: report-preview.md
+          retention-days: 3
+
   build:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
     # Publiczne repo nie zapisuje własnego stanu. Zapis do prywatnego repo

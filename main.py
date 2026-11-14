@@ -12,17 +12,14 @@ import argparse
 import os
 import sys
 import time
-import io
 from datetime import datetime
 from pathlib import Path
-
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
 
 import schedule
 from dotenv import load_dotenv
 
 from report_fetcher import build_report
-from report_builder import DataQualityError
+from report_builder import DataQualityError, scan_watchlist
 from email_sender import send_report_email
 from market_calendar import market_status, warsaw_now
 
@@ -69,6 +66,7 @@ def generate_and_send(config: dict, send_email: bool = True):
     """Generuje raport i opcjonalnie wysyła mailem."""
     
     now = warsaw_now()
+    sec_scan = scan_watchlist(persist=send_email)
     print(f"\n{'='*60}")
     print(f"  📊 Market Report Engine - {now.strftime('%d.%m.%Y %H:%M')}")
     print(f"{'='*60}\n")
@@ -89,7 +87,7 @@ def generate_and_send(config: dict, send_email: bool = True):
     # 1. Generowanie raportu
     print("[1/2] Pobieram dane rynkowe...")
     try:
-        report = build_report()
+        report = build_report(sec_scan=sec_scan)
     except DataQualityError as e:
         # Awaria źródła danych — zamiast raportu pełnego "b/d" wysyłamy krótkie ostrzeżenie
         logger.error(f"Wstrzymano raport — problem z jakością danych: {e}")
@@ -135,7 +133,9 @@ def generate_and_send(config: dict, send_email: bool = True):
             recipient=config["recipient"],
             md_report=report,
         )
-        if not success:
+        if success:
+            sec_scan.acknowledge()
+        else:
             logger.warning("Wysyłka maila nie powiodła się.")
     else:
         print("[2/2] Pominięto wysyłkę e-mail (--no-email)")
@@ -163,36 +163,46 @@ def run_scheduler(config: dict):
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
     parser = argparse.ArgumentParser(
         description="📊 Market Report Engine - codzienny raport rynkowy na e-mail"
     )
-    parser.add_argument(
-        "--schedule", 
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--schedule",
         action="store_true",
         help="Uruchom scheduler (wysyłka codziennie o ustawionej godzinie)"
     )
-    parser.add_argument(
+    mode.add_argument(
         "--no-email",
-        action="store_true", 
+        action="store_true",
         help="Tylko generuj raport, nie wysyłaj e-maila"
     )
-    parser.add_argument(
+    mode.add_argument(
         "--preview",
         action="store_true",
         help="Wyświetl raport w konsoli bez wysyłki"
     )
+    mode.add_argument(
+        "--sec-poll-only",
+        action="store_true",
+        help="Sprawdź SEC i zapisz oczekujące filingi bez generowania i wysyłki raportu",
+    )
     args = parser.parse_args()
     
     # Załaduj .env, aby klucz Gemini był dostępny również dla preview
-    from dotenv import load_dotenv
-    from pathlib import Path
     env_path = Path(__file__).parent / ".env"
     if env_path.exists():
         load_dotenv(env_path)
+
+    if args.sec_poll_only:
+        scan_watchlist(persist=True)
+        return
     
     if args.preview:
         try:
-            # Podgląd nie zapisuje snapshotów ani prognoz — nie psuje danych CI
+            # Podgląd nie zapisuje stanu i nie wymaga SMTP.
             report = build_report(persist_state=False)
         except DataQualityError as e:
             logger.error(f"Wstrzymano raport — problem z jakością danych: {e}")

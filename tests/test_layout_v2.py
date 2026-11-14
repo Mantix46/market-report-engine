@@ -3,12 +3,15 @@
 import os
 import sys
 from datetime import datetime
+from decimal import Decimal
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import layout_v2  # noqa: E402
+from earnings_report import Earnings, Measure, Period
+from sec_edgar import SecScan
 
 
 @pytest.fixture
@@ -93,6 +96,37 @@ def test_benchmarks_table(sample_data):
     assert "**+1.20%**" in md and "**+15.30%**" in md
     # indeks z błędem -> cały wiersz b/d
     assert "| **WIG20** | b/d | b/d | b/d | b/d |" in md
+
+
+def test_ai_and_basic_reports_render_verified_earnings_and_sentiment(sample_data, monkeypatch):
+    day = sample_data["now"].date()
+    source = "https://www.sec.gov/Archives/edgar/data/723125/"
+    entry = Earnings("MU", Period("quarter", day))
+    entry.measures[("revenue", "GAAP")] = Measure(
+        "revenue", "GAAP", "USD", Decimal("2500000000"), source, Decimal("2000000000"),
+    )
+    sample_data.update(
+        earnings=[entry],
+        sec_scan=SecScan(),
+        market_sentiment={"ofr_fsi": None, "cftc_sp500": None},
+    )
+
+    def gemini(prompt, api_key):
+        assert "E1-revenue-GAAP" in prompt
+        assert api_key == "mock-key"
+        sections = "\n\n".join(f"{heading}\nTreść" for heading in layout_v2.V2_AI_HEADERS)
+        return sections + '\n<earnings_selection>{"good":["E1-revenue-GAAP"],"risk":[]}</earnings_selection>'
+
+    monkeypatch.setattr(layout_v2, "_call_gemini_v2", gemini)
+    for report in (
+        layout_v2.render_ai_report_v2(sample_data, "mock-key"),
+        layout_v2.render_basic_report_v2(sample_data),
+    ):
+        assert report.index("## SEC EDGAR") < report.index("## Wyniki spółek")
+        assert "**Bardzo dobre** • Przychody (GAAP) 2,5 mld USD" in report
+        assert f"[SEC]({source})" in report
+        assert report.index("## 9. Sentyment") < report.index("OFR Financial Stress Index")
+        assert "<earnings_selection>" not in report
 
 
 def test_macro_section_emoji_and_today_prefix(sample_data):

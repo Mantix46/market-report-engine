@@ -26,6 +26,9 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from gemini_client import call_gemini
+from earnings_report import earnings_prompt, extract_earnings_selection, render_earnings
+from market_sentiment import render_market_sentiment
+from sec_edgar import render_sec
 from data_fetching import (
     US_TICKERS, GPW_TICKERS_MAP, TICKER_NAMES, TICKER_NOTES,
     get_index_tickers_v2, fetch_period_change, fetch_analyst_recommendations,
@@ -695,9 +698,21 @@ def _saturday_extras_md(data: dict) -> str:
     return md
 
 
-def _assemble_report(data: dict, ai_sections: dict) -> str:
+def _assemble_report(data: dict, ai_sections: dict, earnings_selection=None) -> str:
     """Składa finalny raport v2: nagłówek + sekcje 1-10 w kolejności + disclaimer.
     W sobotę dodatkowo: analiza trendu, trafność prognoz i prognozy do weryfikacji."""
+    filing_sections = []
+    if "sec_scan" in data:
+        filing_sections.extend([render_sec(data["sec_scan"]), "", "---", ""])
+    if data.get("earnings"):
+        filing_sections.extend([
+            "## Wyniki spółek", "", render_earnings(data["earnings"], earnings_selection),
+            "", "---", "",
+        ])
+    sentiment = (
+        ["", render_market_sentiment(data["market_sentiment"])]
+        if "market_sentiment" in data else []
+    )
     parts = [
         _header_v2(data["now"], data["skip"], data["status"]).rstrip("\n"),
         "",
@@ -715,6 +730,7 @@ def _assemble_report(data: dict, ai_sections: dict) -> str:
         "",
         "---",
         "",
+        *filing_sections,
         ai_sections["## 5. Top 5 wydarzeń makro"],
         "",
         "---",
@@ -730,6 +746,7 @@ def _assemble_report(data: dict, ai_sections: dict) -> str:
         "---",
         "",
         ai_sections["## 9. Sentyment"],
+        *sentiment,
         "",
         "---",
         "",
@@ -760,7 +777,13 @@ def render_ai_report_v2(data: dict, api_key: str) -> str:
     is_saturday = data.get("is_saturday", False)
     headers = V2_AI_HEADERS + ([PREDICTION_REVIEW_HEADER, PREDICTIONS_HEADER] if is_saturday else [])
     prompt = _build_prompt_v2(data)
+    earnings = data.get("earnings")
+    if earnings:
+        prompt += "\n\n" + earnings_prompt(earnings)
     response_text = _call_gemini_v2(prompt, api_key)
+    earnings_selection = None
+    if earnings:
+        response_text, earnings_selection = extract_earnings_selection(response_text)
     ai_sections = _parse_ai_sections(response_text, headers)
     gemini_predictions = []
     if is_saturday:
@@ -772,7 +795,7 @@ def render_ai_report_v2(data: dict, api_key: str) -> str:
             raise ValueError(
                 "Gemini nie wygenerował prognoz dla aktywnych spółek: " + ", ".join(missing)
             )
-    final_report = _assemble_report(data, ai_sections)
+    final_report = _assemble_report(data, ai_sections, earnings_selection)
 
     # Zapis prognoz do trackera — tylko w sobotę, nie w podglądzie.
     if is_saturday and data.get("persist", True):

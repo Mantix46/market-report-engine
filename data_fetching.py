@@ -15,6 +15,7 @@ import sys
 import logging
 
 from market_calendar import warsaw_today
+from sec_edgar import SecError, sec_budget, sec_get
 
 logger = logging.getLogger(__name__)
 
@@ -452,9 +453,6 @@ def fetch_analyst_recommendations(ticker: str) -> dict:
     return out
 
 
-SEC_USER_AGENT = (
-    "MarketReportEngine/1.0 (https://github.com/Mantix46/market-report-engine)"
-)
 FORM4_FILING_LIMIT = 8
 _PRICE_IN_TEXT_RE = re.compile(
     r"at price\s+([\d.,]+)(?:\s*-\s*([\d.,]+))?\s+per share",
@@ -605,28 +603,24 @@ def fetch_fmp_insider_trades(ticker: str, cutoff) -> list[dict]:
 def fetch_form4_plan_map(fmp_trades: list[dict], max_filings: int = FORM4_FILING_LIMIT) -> dict:
     flags = {}
     fetched = 0
-    for trade in fmp_trades:
-        link = trade.get("link") or ""
-        txt_url = form4_txt_url(link)
-        if not txt_url or txt_url in flags:
-            continue
-        if fetched >= max_filings:
-            break
-        fetched += 1
-        try:
-            response = requests.get(
-                txt_url,
-                headers={"User-Agent": SEC_USER_AGENT, "Accept-Encoding": "gzip, deflate"},
-                timeout=12,
-            )
-            flag = parse_form4_plan_flag(response.text) if response.ok else None
-        except Exception as exc:
-            logger.debug(f"Form 4 {txt_url}: {exc}")
-            flag = None
-        flags[txt_url] = flag
-        if link:
-            flags[link] = flag
-        time.sleep(0.15)
+    with sec_budget(20):
+        for trade in fmp_trades:
+            link = trade.get("link") or ""
+            txt_url = form4_txt_url(link)
+            if not txt_url or txt_url in flags:
+                continue
+            if fetched >= max_filings:
+                break
+            fetched += 1
+            try:
+                with sec_get(txt_url) as response:
+                    flag = parse_form4_plan_flag(response.text)
+            except SecError as exc:
+                logger.debug("Form 4 SEC: %s", exc)
+                flag = None
+            flags[txt_url] = flag
+            if link:
+                flags[link] = flag
     return flags
 
 

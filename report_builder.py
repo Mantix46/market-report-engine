@@ -23,6 +23,10 @@ from technicals import calc_relative_strength, fetch_technicals
 from snapshot_store import load_last_snapshots, save_today_snapshots
 
 from market_calendar import market_status, warsaw_now
+from sec_edgar import SecScan, configured_sec_tickers, poll_sec
+from earnings_report import collect_earnings
+from guidance_consensus import load_guidance_estimates, refresh_guidance_estimates
+from market_sentiment import collect_market_sentiment
 
 import logging
 
@@ -37,6 +41,14 @@ MIN_DATA_QUALITY = 0.5
 
 class DataQualityError(Exception):
     """Zbyt malo poprawnych danych rynkowych, by wygenerowac wiarygodny raport."""
+
+
+def scan_watchlist(*, persist: bool) -> SecScan:
+    try:
+        return poll_sec(configured_sec_tickers(US_TICKERS), persist=persist)
+    except Exception as exc:
+        logger.warning("SEC EDGAR: nie udało się sprawdzić zgłoszeń (%s).", type(exc).__name__)
+        return SecScan(warnings=["Nie udało się sprawdzić nowych zgłoszeń SEC EDGAR."])
 
 
 def markets_to_skip(status: dict) -> set:
@@ -465,7 +477,21 @@ def _fmt_portfolio_block(portfolio_details: dict) -> str:
 # FAZA 3: Orkiestracja
 # ============================================================
 
-def build_report(persist_state: bool = True) -> str:
+def _collect_enrichments(data: dict, sec_scan: Optional[SecScan], persist_state: bool) -> None:
+    data["sec_scan"] = sec_scan if sec_scan is not None else scan_watchlist(persist=False)
+    estimates = load_guidance_estimates()
+    try:
+        data["earnings"] = collect_earnings(data["sec_scan"].filings, guidance_estimates=estimates)
+    except Exception as exc:
+        logger.warning("Wyniki SEC: nie udało się odczytać danych (%s).", type(exc).__name__)
+        data["earnings"] = []
+        data["sec_scan"].warnings.append("Odczyt danych wynikowych SEC nie powiódł się. Sprawdź linki do filingów.")
+    data["market_sentiment"] = collect_market_sentiment(data["now"].date())
+    if persist_state:
+        refresh_guidance_estimates(configured_sec_tickers(US_TICKERS), estimates)
+
+
+def build_report(persist_state: bool = True, *, sec_scan: Optional[SecScan] = None) -> str:
     """Generuje raport (layout v2 — jedyny aktywny układ, patrz layout_v2.py):
     zbiera dane RAZ, próbuje Gemini, przy awarii renderuje raport regułowy
     z TYCH SAMYCH danych (bez ponownego pobierania).
@@ -479,6 +505,7 @@ def build_report(persist_state: bool = True) -> str:
     )
 
     data = collect_report_data(persist_state)  # DataQualityError propaguje do main.py
+    _collect_enrichments(data, sec_scan, persist_state)
 
     # Import leniwy — layout_v2 importuje helpery z tego modułu (unikamy cyklu)
     from layout_v2 import collect_v2_extras, render_ai_report_v2, render_basic_report_v2
@@ -499,6 +526,7 @@ def build_basic_report(persist_state: bool = True) -> str:
     """Buduje raport regułowy (bez AI) — zachowane dla kompatybilności z report_fetcher."""
     from layout_v2 import collect_v2_extras, render_basic_report_v2
     data = collect_report_data(persist_state)
+    _collect_enrichments(data, None, persist_state)
     collect_v2_extras(data)
     return render_basic_report_v2(data)
 

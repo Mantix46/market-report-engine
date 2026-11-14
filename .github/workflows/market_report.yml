@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  preview:
+  test-email:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/probable_main_upgrade'
     runs-on: ubuntu-latest
     permissions:
@@ -21,6 +21,14 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          persist-credentials: false
+
+      - name: Read private watchlist and history
+        uses: actions/checkout@v6
+        with:
+          repository: Mantix46/market-report-state
+          token: ${{ secrets.STATE_REPO_TOKEN }}
+          path: private-input
           persist-credentials: false
 
       - uses: actions/setup-python@v5
@@ -33,30 +41,46 @@ jobs:
           python -m pip install -r requirements.txt pytest
           python -m pytest -q
 
-      - name: Generate report preview without SMTP
+      - name: Generate and send test report
         env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
           SEC_CONTACT_EMAIL: ${{ secrets.SEC_CONTACT_EMAIL || vars.SEC_CONTACT_EMAIL }}
-          SEC_TICKERS: NBIS,MU,FPS,AAOI,AVGO
+          SEC_TICKERS: ${{ vars.SEC_TICKERS || 'NBIS,MU,FPS,AAOI,AVGO' }}
         run: |
           set -euo pipefail
-          cp watchlists.example.json watchlists.json
-          python main.py --preview > report-preview.md
-          for heading in '# RAPORT RYNKOWY' '## SEC EDGAR' '## 9. Sentyment' '## 10. Watchlist'; do
-            if ! grep -Fq "$heading" report-preview.md; then
-              echo "::error::Nie wygenerowano pełnego podglądu. Brakuje sekcji: $heading"
-              exit 1
-            fi
-          done
-          if [[ -z "$SEC_CONTACT_EMAIL" ]]; then
-            echo "::warning::Brak SEC_CONTACT_EMAIL. Podgląd sprawdził zachowanie bez dostępu do SEC."
+          cp private-input/{watchlists.json,daily_snapshots.csv,prediction_tracker.csv} .
+          # Read any existing guidance estimates, but use a fresh SEC filing window for the test.
+          if [[ -f private-input/earnings_consensus.json ]]; then
+            mkdir -p state
+            cp private-input/earnings_consensus.json state/
           fi
+          python - <<'PY'
+          from email_sender import send_report_email
+          from main import load_config
+          from market_calendar import warsaw_now
+          from report_fetcher import build_report
 
-      - name: Upload sample report
-        uses: actions/upload-artifact@v4
-        with:
-          name: market-report-preview
-          path: report-preview.md
-          retention-days: 3
+          config = load_config()
+          report = build_report(persist_state=False)
+          if not send_report_email(
+              smtp_server=config["smtp_server"],
+              smtp_port=config["smtp_port"],
+              smtp_user=config["smtp_user"],
+              smtp_password=config["smtp_password"],
+              recipient=config["recipient"],
+              md_report=report,
+              subject=f"[TEST] Raport Rynkowy — {warsaw_now():%d.%m.%Y}",
+          ):
+              raise SystemExit("Wysyłka testowa przez SMTP nie powiodła się.")
+          PY
 
   build:
     if: github.ref == 'refs/heads/main'

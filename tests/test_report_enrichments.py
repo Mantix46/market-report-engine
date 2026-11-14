@@ -80,8 +80,9 @@ def test_poll_only_persists_sec_without_loading_smtp_or_building_report(monkeypa
     load_config.assert_not_called()
 
 
-def test_preview_collects_sec_and_sentiment_without_refreshing_guidance(monkeypatch):
-    data = {"now": datetime(2026, 11, 14, 7, 30)}
+@pytest.mark.parametrize("saturday", [False, True])
+def test_preview_collects_sec_and_sentiment_without_refreshing_guidance(monkeypatch, saturday):
+    data = {"now": datetime(2026, 11, 14, 7, 30), "is_saturday": saturday}
     scan = SecScan(warnings=["SEC temporarily unavailable"])
     snapshot = [{"ticker": "MU"}]
     earnings = Mock(return_value=[])
@@ -98,7 +99,10 @@ def test_preview_collects_sec_and_sentiment_without_refreshing_guidance(monkeypa
 
     scan_watchlist.assert_called_once_with(persist=False)
     refresh.assert_not_called()
-    earnings.assert_called_once_with([], guidance_estimates=snapshot)
+    if saturday:
+        earnings.assert_called_once_with(scan.weekly_filings, guidance_estimates=snapshot)
+    else:
+        earnings.assert_not_called()
     sentiment.assert_called_once_with(date(2026, 11, 14))
     assert data["sec_scan"] is scan
     assert data["market_sentiment"] == sentiment.return_value
@@ -120,12 +124,13 @@ def test_guidance_snapshot_keeps_future_estimates_with_explicit_capture_time():
 
 @pytest.mark.parametrize("earnings_failure", [False, True])
 def test_optional_provider_failures_reach_smtp_and_keep_other_sentiment(monkeypatch, tmp_path, earnings_failure):
-    clock = datetime(2026, 11, 13, 7, 30)
+    clock = datetime(2026, 11, 14 if earnings_failure else 13, 7, 30)
     status = {"US": {"open": True}, "PL": {"open": True}}
     filing_url = f"{ARCHIVES_URL}/1513845/000110465926126008/0001104659-26-126008-index.htm"
     filing = Filing("NBIS", "0001513845", "0001104659-26-126008", "6-K", "2026-11-12",
                     "2026-11-12", "", (), "tm2629571d1_6k.htm", filing_url)
-    scan = SecScan(warnings=["SEC HTTP 503"], filings=[filing] if earnings_failure else [])
+    filings = [filing] if earnings_failure else []
+    scan = SecScan(warnings=["SEC HTTP 503"], filings=filings, weekly_filings=filings)
     if earnings_failure:
         monkeypatch.setattr(report_builder, "collect_earnings", Mock(side_effect=ValueError("invalid exhibit")))
     acknowledge = Mock()
@@ -140,6 +145,8 @@ def test_optional_provider_failures_reach_smtp_and_keep_other_sentiment(monkeypa
     monkeypatch.setattr(report_builder, "collect_report_data", lambda persist: {
         "now": clock, "skip": set(), "status": status, "active_tickers": [],
         "persist": persist, "v2": {"index_quotes": {}}, "macro_quotes": {}, "macro_calendar": [],
+        "is_saturday": earnings_failure, "portfolio_details": {}, "prediction_evaluation": {},
+        "prediction_feedback": {},
     })
     monkeypatch.setattr(layout_v2, "collect_v2_extras", Mock())
     monkeypatch.setattr(layout_v2, "render_basic_report_v2", lambda data: layout_v2._assemble_report(
@@ -163,7 +170,7 @@ def test_optional_provider_failures_reach_smtp_and_keep_other_sentiment(monkeypa
     assert "SEC HTTP 503" in md
     if earnings_failure:
         assert filing_url in md
-        assert "Odczyt danych wynikowych SEC nie powiódł się" in md
+        assert "Dane wynikowe SEC niedostępne dla sobotnich prognoz." in md
     assert "OFR Financial Stress Index** · b/d" in md
     assert "-11,25%" in md
     acknowledge.assert_called_once_with()

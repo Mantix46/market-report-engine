@@ -22,11 +22,12 @@ Gemini i zapisuje zarówno benchmark techniczny, jak i prognozę wieloczynnikow�
 
 import json
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Optional
 
 from gemini_client import call_gemini
-from earnings_report import earnings_prompt, extract_earnings_selection, render_earnings
+from earnings_report import format_earnings_context
 from market_sentiment import render_market_sentiment
 from sec_edgar import render_sec
 from data_fetching import (
@@ -445,6 +446,7 @@ def _prediction_context(data: dict, ticker: str) -> str:
             "days_until": earnings.get("days_until", ""),
         },
         "earnings_call": earnings_call,
+        "market_sentiment": data.get("market_sentiment", {}),
         "macro_calendar": [
             {
                 "date": item.get("date") or item.get("date_range", ""),
@@ -506,6 +508,18 @@ def _enrich_predictions(data: dict, predictions: list[dict], source: str) -> lis
     return predictions
 
 
+_FORECAST_INSTRUCTIONS = """
+    Dodaj prognozę dla KAŻDEJ aktywnej spółki portfela na horyzont 5 sesji.
+    Połącz technikę z newsami, rekomendacjami, insiderami i kalendarzem makro.
+    Oceń, czy kierunek stresu finansowego OFR i zmiana pozycjonowania CFTC
+    wspierają prognozę lub zwiększają ryzyko. Uwzględnij daty i możliwy hedging.
+    Przy rozbieżnych, opóźnionych lub brakujących odczytach odpowiednio ogranicz ich wagę.
+    Nie twórz katalizatora, którego nie ma w danych. Bez rekomendacji inwestycyjnych.
+    Format każdej prognozy MUSI być:
+    - TICKER: kierunek=up/down/neutral; horyzont=5 sesji; pewność=niska|średnia|wysoka; katalizatory=...; ryzyka=...; unieważnienie=...; teza=jednozdaniowa teza.
+"""
+
+
 def _build_prompt_v2(data: dict) -> str:
     """Prompt Gemini dla 5 sekcji narracyjnych layoutu v2."""
     movers = data["today_movers"]
@@ -543,11 +557,7 @@ def _build_prompt_v2(data: dict) -> str:
     - YYYY-MM-DD TICKER: wynik=trafiona|nietrafiona; wyjaśnienie=...; przeważyło=...; lekcja=...
 
     {PREDICTIONS_HEADER}
-    Dodaj prognozę dla KAŻDEJ aktywnej spółki portfela na horyzont 5 sesji.
-    Połącz technikę z newsami, wynikami, rekomendacjami, insiderami, kalendarzem makro
-    i innymi informacjami nadchodzącymi. Nie twórz katalizatora, którego nie ma w danych.
-    Format każdej prognozy MUSI być:
-    - TICKER: kierunek=up/down/neutral; horyzont=5 sesji; pewność=niska|średnia|wysoka; katalizatory=...; ryzyka=...; unieważnienie=...; teza=jednozdaniowa teza.
+    {_FORECAST_INSTRUCTIONS}
     """
 
     n_sections = "osiem" if is_saturday else "sześć"
@@ -563,6 +573,7 @@ def _build_prompt_v2(data: dict) -> str:
     5-10 zwięzłych punktów do przeczytania w minutę: co wydarzyło się od poprzedniego raportu
     (wykorzystaj pola "co się zmieniło od poprzedniego raportu" z danych spółek), które spółki
     wymagają dziś uwagi i dlaczego, najważniejsze informacje makro, czy zmienił się sentyment rynku.
+    Uwzględnij dostępne OFR Financial Stress Index i CFTC COT w ocenie nastrojów.
     Każdy punkt oznacz wagą: 🔴 (wysoki wpływ), 🟠 (średni), 🟢 (niski).
 
     ## 4. Monitoring spółek
@@ -592,6 +603,9 @@ def _build_prompt_v2(data: dict) -> str:
     ## 9. Sentyment
     Synteza nastroju rynku z dostarczonych PROXY (nazwij wprost źródła): poziom VIX, short interest,
     sygnały insiderów, nietypowy wolumen, kierunek zmian rekomendacji analityków, ton newsów.
+    Zinterpretuj także poziom i zmianę OFR (stres finansowy) oraz CFTC (pozycja netto funduszy
+    lewarowanych w kontraktach na S&P 500). Uwzględnij datę obserwacji, opóźnienia i możliwy hedging.
+    Pomiń brakujące odczyty w ocenie kierunku.
     Werdykt: czy news flow jest pozytywny/negatywny/mieszany i czy sentyment się zmienia.
 
     ## 10. Watchlist
@@ -599,6 +613,7 @@ def _build_prompt_v2(data: dict) -> str:
     co może być katalizatorem, na co konkretnie zwrócić uwagę (poziom ceny, wskaźnik, data).
     {saturday_sections}
     ZASADY (bezwzględnie przestrzegaj):
+    - Opublikowanych sprawozdań nie streszczaj w raporcie. Daty nadchodzących wyników możesz podawać.
     - NIE wymyślaj newsów, wydarzeń ani danych spoza dostarczonych poniżej.
     - Brak katalizatora ruchu -> napisz wprost: "brak jednoznacznego katalizatora w dostępnych informacjach".
     - Podawaj konkretne liczby (RSI, P/E, short float, ceny docelowe) — masz je w danych.
@@ -636,6 +651,7 @@ def _build_prompt_v2(data: dict) -> str:
 
     SYGNAŁY SENTYMENTU (proxy):
 {_sentiment_data_block(data)}
+{render_market_sentiment(data.get("market_sentiment"))}
 
     HISTORIA TRAFNOŚCI I LEKCJE:
     Podsumowanie: {feedback.get('summary', 'b/d')}
@@ -698,17 +714,12 @@ def _saturday_extras_md(data: dict) -> str:
     return md
 
 
-def _assemble_report(data: dict, ai_sections: dict, earnings_selection=None) -> str:
+def _assemble_report(data: dict, ai_sections: dict) -> str:
     """Składa finalny raport v2: nagłówek + sekcje 1-10 w kolejności + disclaimer.
     W sobotę dodatkowo: analiza trendu, trafność prognoz i prognozy do weryfikacji."""
     filing_sections = []
     if "sec_scan" in data:
         filing_sections.extend([render_sec(data["sec_scan"]), "", "---", ""])
-    if data.get("earnings"):
-        filing_sections.extend([
-            "## Wyniki spółek", "", render_earnings(data["earnings"], earnings_selection),
-            "", "---", "",
-        ])
     sentiment = (
         ["", render_market_sentiment(data["market_sentiment"])]
         if "market_sentiment" in data else []
@@ -771,31 +782,78 @@ def _assemble_report(data: dict, ai_sections: dict, earnings_selection=None) -> 
     return "\n".join(parts)
 
 
+def _weekly_forecasts(data: dict, original: str, api_key: str) -> tuple[str, list[dict]]:
+    tickers = data["active_tickers"]
+    prices = data["current_prices"]
+    baseline = extract_predictions_from_report(original, tickers, prices)
+    earnings = format_earnings_context(data.get("earnings", []), tickers)
+    if not earnings:
+        return original, baseline
+    recent_moves = "\n".join(f"- {ticker}: {_week_facts_line(data, ticker)}" for ticker in tickers)
+
+    # Keep SEC financial data out of the prompt for the body of the email.
+    prompt = f"""
+    Zaktualizuj sobotnią prognozę kierunku na pięć sesji. Pisz zwięźle po polsku.
+    Zwróć wyłącznie nagłówek {PREDICTIONS_HEADER} i jeden wiersz dla każdej z tych spółek: {', '.join(tickers)}.
+    {_FORECAST_INSTRUCTIONS}
+    Przeanalizuj wyniki SEC, marże, guidance i zaskoczenia względem konsensusu, jeśli są dostępne.
+    Napisz w katalizatorach, ryzykach lub tezie, DLACZEGO konkretny czynnik może wesprzeć albo
+    osłabić kurs w następnym tygodniu. Rozważ, czy reakcja kursu wskazuje na uwzględnienie
+    informacji w cenie. W raporcie podaj wyłącznie jakościowy wpływ wyników, bez kwot,
+    wskaźników finansowych spółki, procentowych zaskoczeń i streszczeń sprawozdań.
+    Poza tickerem i polem horyzont=5 sesji pisz jakościowo, bez cyfr.
+
+    Dotychczasowa prognoza bez danych SEC:
+    {original}
+
+    Ruchy spółek od ostatnich pięciu sesji:
+    {recent_moves}
+
+    Sentyment rynku:
+    {render_market_sentiment(data.get("market_sentiment"))}
+
+    WYNIKI SEC, WYŁĄCZNIE DO OCENY KIERUNKU:
+    {earnings}
+    """
+    try:
+        response = _call_gemini_v2(prompt, api_key)
+        section = _parse_ai_sections(response, [PREDICTIONS_HEADER])[PREDICTIONS_HEADER]
+        lines = [line.strip() for line in section.splitlines()[1:] if line.strip()]
+        revised = extract_predictions_from_report(section, tickers, prices)
+        qualitative = all(
+            line.startswith(f'- {forecast["ticker"]}:') and not re.search(
+                r"\d", line.partition(":")[2].replace("horyzont=5 sesji;", "", 1),
+            )
+            for line, forecast in zip(lines, revised)
+        )
+        if (len(lines) == len(revised) == len(tickers) and qualitative
+                and {p["ticker"] for p in revised} == set(tickers)):
+            return section, revised
+        logger.warning("Gemini: niepełna aktualizacja sobotnich prognoz na podstawie SEC.")
+    except Exception as exc:
+        logger.warning("Gemini: aktualizacja sobotnich prognoz SEC nie powiodła się (%s).", type(exc).__name__)
+    return original, baseline
+
+
 def render_ai_report_v2(data: dict, api_key: str) -> str:
     """Renderuje raport v2 przez Gemini. Rzuca wyjątek przy niepowodzeniu
     (report_builder.build_report łapie go i woła render_basic_report_v2)."""
     is_saturday = data.get("is_saturday", False)
     headers = V2_AI_HEADERS + ([PREDICTION_REVIEW_HEADER, PREDICTIONS_HEADER] if is_saturday else [])
     prompt = _build_prompt_v2(data)
-    earnings = data.get("earnings")
-    if earnings:
-        prompt += "\n\n" + earnings_prompt(earnings)
     response_text = _call_gemini_v2(prompt, api_key)
-    earnings_selection = None
-    if earnings:
-        response_text, earnings_selection = extract_earnings_selection(response_text)
     ai_sections = _parse_ai_sections(response_text, headers)
     gemini_predictions = []
     if is_saturday:
-        gemini_predictions = extract_predictions_from_report(
-            response_text, data["active_tickers"], data["current_prices"]
+        ai_sections[PREDICTIONS_HEADER], gemini_predictions = _weekly_forecasts(
+            data, ai_sections[PREDICTIONS_HEADER], api_key,
         )
         missing = sorted(set(data["active_tickers"]) - {p.get("ticker") for p in gemini_predictions})
         if missing:
             raise ValueError(
                 "Gemini nie wygenerował prognoz dla aktywnych spółek: " + ", ".join(missing)
             )
-    final_report = _assemble_report(data, ai_sections, earnings_selection)
+    final_report = _assemble_report(data, ai_sections)
 
     # Zapis prognoz do trackera — tylko w sobotę, nie w podglądzie.
     if is_saturday and data.get("persist", True):

@@ -4,7 +4,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
-import json
 import logging
 import os
 import re
@@ -1032,11 +1031,6 @@ def collect_earnings(filings, *, fmp_key=None, guidance_estimates=(), yahoo_fall
         entry.period.scope if entry.period else "",
     ))
 
-_SELECTION = re.compile(r"<earnings_selection>(.*?)</earnings_selection>", re.S)
-_SELECTION_OPEN = re.compile(r"<earnings_selection(?:\s[^>]*)?>", re.I)
-_CATEGORY_LABELS = {"good": "Bardzo dobre", "risk": "Ryzyka"}
-
-
 def _fmt_decimal(value, places=2):
     return f"{value:,.{places}f}".rstrip("0").rstrip(".").replace(",", " ").replace(".", ",")
 
@@ -1087,94 +1081,6 @@ def _guidance_text(item):
     return f"{METRIC_LABELS[item.metric]}{_basis_label(item.basis)}, {item.fiscal_label} • {value}"
 
 
-def _categorized_facts(earnings):
-    """Every selectable fact already has a category, source and local wording."""
-    for index, entry in enumerate(earnings, 1):
-        declining = set()
-        for (metric, basis), measure in entry.measures.items():
-            if basis == "adjusted" and (metric, "GAAP") in entry.measures:
-                continue
-            if measure.previous is None or measure.value == measure.previous:
-                continue
-            category = "good" if measure.value > measure.previous else "risk"
-            fact_id = f"E{index}-{metric}-{basis}"
-            if category == "risk":
-                declining.add(metric)
-            yield index, fact_id, category, _measure_text(measure), measure.source
-        for metric in ("operating_income", "net_income", "eps"):
-            if metric in declining:
-                continue
-            measure = next((m for (name, basis), m in entry.measures.items()
-                            if name == metric and basis in ("GAAP", "IFRS")), None)
-            if measure and measure.value < 0:
-                fact_id = f"E{index}-{metric}-negative"
-                value = _fmt_measure(measure.value, metric, measure.currency)
-                label = METRIC_LABELS[metric] + _basis_label(measure.basis)
-                yield index, fact_id, "risk", f"{label} pozostał ujemny ({value})", measure.source
-        for (metric, basis), comparison in entry.result_consensus.items():
-            measure = entry.measures[(metric, basis)]
-            delta = measure.value - comparison.estimate
-            if delta:
-                category = "good" if delta > 0 else "risk"
-                fact_id = f"E{index}-{metric}-{basis}-consensus"
-                relation = "powyżej konsensusu" if delta > 0 else "poniżej konsensusu"
-                yield index, fact_id, category, f"{_measure_text(measure)} • {relation}", measure.source
-
-
-def earnings_prompt(earnings):
-    facts = list(_categorized_facts(earnings))
-    if not facts:
-        return ""
-    rows = "\n".join(
-        f"{fact_id} | {category} | {earnings[index - 1].ticker} | {label}"
-        for index, fact_id, category, label, _ in facts
-    )
-    return (
-        "\nPO DOKŁADNIE WYMAGANYCH SEKCJACH dodaj jeden blok na końcu. "
-        "Dla każdej spółki i okresu wybierz do dwóch najistotniejszych identyfikatorów "
-        "z każdej z oznaczonych grup. Skopiuj wyłącznie identyfikatory i zachowaj ich kategorię. "
-        "Nie dodawaj liczb ani komentarzy z tej listy w tekście sekcji. Format bloku:\n"
-        '<earnings_selection>{"good":["E1-revenue-GAAP"],"risk":[]}</earnings_selection>\n'
-        f"Identyfikatory i fakty SEC:\n{rows}\n"
-    )
-
-
-def extract_earnings_selection(text):
-    blocks = list(_SELECTION.finditer(text))
-    clean = _SELECTION.sub("", text).strip()
-    if unmatched := _SELECTION_OPEN.search(clean):
-        return clean[:unmatched.start()].rstrip(), None
-    if len(blocks) != 1 or len(blocks[0][1]) > 12000:
-        return clean, None
-    try:
-        selection = json.loads(blocks[0][1])
-    except (ValueError, RecursionError):
-        return clean, None
-    if not isinstance(selection, dict) or set(selection) != set(_CATEGORY_LABELS):
-        return clean, None
-    if any(not isinstance(ids, list) or not all(isinstance(fact_id, str) for fact_id in ids)
-           or len(set(ids)) != len(ids) for ids in selection.values()):
-        return clean, None
-    return clean, selection
-
-
-def _selected_facts(facts, selection):
-    if selection is None:
-        return {}
-    known = {fact_id: (index, category) for index, fact_id, category, _, _ in facts}
-    selected = {}
-    for category in _CATEGORY_LABELS:
-        for fact_id in selection.get(category, ()):
-            owner = known.get(fact_id)
-            if owner is None or owner[1] != category:
-                return {}
-            ids = selected.setdefault(owner, [])
-            if len(ids) >= 2:
-                return {}
-            ids.append(fact_id)
-    return selected
-
-
 def _comparison_note(entry, key, measure):
     estimate = entry.result_consensus.get(key)
     if estimate is None:
@@ -1204,38 +1110,24 @@ def _guidance_note(entry, guidance):
     return f"{direction} • {consensus} ([konsensus z {comparison.as_of}]({comparison.source}))"
 
 
-def render_earnings(earnings, selection=None):
-    if not earnings:
-        return "*Brak rozpoznanych publikacji wynikowych SEC w tym wydaniu.*"
-    facts = list(_categorized_facts(earnings))
-    selected = _selected_facts(facts, selection)
-    lines = []
-    for index, entry in enumerate(earnings, 1):
-        period = (f"{SCOPE_LABELS[entry.period.scope]} do {entry.period.end.isoformat()}"
-                  if entry.period else "okres b/d")
-        lines += [f"**{entry.ticker} • {period}**", ""]
-        for metric in ("revenue", "eps"):
-            available = [(key, m) for key, m in entry.measures.items() if m.metric == metric]
-            if not available:
-                ambiguous = any(name == metric for name, _ in entry.conflicts)
-                reason = "rozbieżność źródeł" if ambiguous else "brak jednoznacznej wartości"
-                lines.append(f"- {METRIC_LABELS[metric]} b/d ({reason}).")
-            for key, measure in available:
-                comparison = _comparison_note(entry, key, measure)
-                lines.append(f"- {_measure_text(measure)} • {comparison}. [SEC]({measure.source})")
-        if entry.guidance:
-            for guidance in entry.guidance:
-                lines.append(f"- **Guidance** • {_guidance_text(guidance)} • "
-                             f"{_guidance_note(entry, guidance)}. [SEC]({guidance.source})")
-        else:
-            lines.append("- **Guidance** b/d.")
-        for category, label in _CATEGORY_LABELS.items():
-            available = [fact for fact in facts if fact[0] == index and fact[2] == category]
-            ids = selected.get((index, category), ())
-            chosen = [fact for fact_id in ids for fact in available if fact[1] == fact_id] or available[:2]
-            lines.extend(f"- **{label}** • {fact[3]}. [SEC]({fact[4]})" for fact in chosen)
-            if not chosen:
-                lines.append(f"- **{label}** b/d.")
-        links = " · ".join(f"[{filing.form} z {filing.filing_date}]({filing.url})" for filing in entry.filings)
-        lines.extend([f"- Zgłoszenia SEC • {links}", ""])
-    return "\n".join(lines).rstrip()
+def format_earnings_context(earnings: list[Earnings], tickers: list[str]) -> str:
+    """Financial facts for the forecast prompt, grouped by portfolio ticker and fiscal period."""
+    sections = []
+    for entry in earnings:
+        if entry.ticker not in tickers or not (entry.measures or entry.guidance):
+            continue
+        period = (
+            f"{SCOPE_LABELS[entry.period.scope]} do {entry.period.end.isoformat()}"
+            if entry.period else "okres b/d"
+        )
+        dates = ", ".join(sorted({filing.filing_date for filing in entry.filings}))
+        lines = [f"{entry.ticker} • {period} • zgłoszono {dates or 'b/d'}"]
+        for key, measure in entry.measures.items():
+            comparison = _comparison_note(entry, key, measure) if measure.metric in ("eps", "revenue") else ""
+            detail = f" • {comparison}" if comparison else ""
+            lines.append(f"- {_measure_text(measure)}{detail}. [SEC]({measure.source})")
+        for guidance in entry.guidance:
+            lines.append(f"- Guidance • {_guidance_text(guidance)} • "
+                         f"{_guidance_note(entry, guidance)}. [SEC]({guidance.source})")
+        sections.append("\n".join(lines))
+    return "\n\n".join(sections)

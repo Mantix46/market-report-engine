@@ -83,8 +83,7 @@ def test_foreign_release_without_xbrl_merges_same_period_and_ignores_financing(m
     assert {row.accession for row in result.filings} == {NBIS_RELEASE.accession, NBIS_STATEMENTS.accession}
     assert result.measures[("revenue", "GAAP")].value == Decimal("980800000")
     assert result.measures[("eps", "GAAP")].value == Decimal("-0.13")
-    assert "**Ryzyka**" in earnings.render_earnings([result])
-    assert "pozostał ujemny" in earnings.render_earnings([result])
+    assert "-0,13 USD/akcję" in earnings.format_earnings_context([result], ["NBIS"])
     facts.assert_called_once_with(NBIS_RELEASE.cik)
 
 
@@ -145,29 +144,16 @@ def test_yahoo_eps_fallback_reads_actual_announcement_day_and_known_values(monke
     ticker.get_earnings_history.assert_not_called()
 
 
-@pytest.mark.parametrize("payload", ['{"good":["999 USD"],"risk":[]}', '{"good":[999],"risk":[]}', 'not JSON'])
-def test_untrusted_model_selection_falls_back_to_sec_facts(payload):
+def test_forecast_context_includes_verified_facts_only_for_requested_tickers():
     entry = earnings.Earnings("AVGO", earnings.Period("quarter", date(2026, 8, 2)), filings=[AVGO_10Q])
     entry.measures[("revenue", "GAAP")] = earnings.Measure(
         "revenue", "GAAP", "USD", Decimal("29591000000"), AVGO_10Q.url,
         previous=Decimal("15952000000"), previous_end=date(2025, 8, 3),
     )
-    text, selection = earnings.extract_earnings_selection(
-        f"## Raport\nTreść\n<earnings_selection>{payload}</earnings_selection>"
-    )
-
-    assert text == "## Raport\nTreść"
-    assert earnings.render_earnings([entry], selection) == earnings.render_earnings([entry])
-    assert "999 USD" not in earnings.render_earnings([entry], selection)
-    assert AVGO_10Q.url in earnings.render_earnings([entry], selection)
-
-
-def test_truncated_model_selection_is_removed_from_report():
-    heading = "## 10. Watchlist\nTreść"
-    clean, selection = earnings.extract_earnings_selection(f'{heading}\n<earnings_selection>{{"good":["999 USD"')
-
-    assert clean == heading
-    assert selection is None
+    context = earnings.format_earnings_context([entry], ["AVGO"])
+    assert "29,591 mld USD" in context
+    assert AVGO_10Q.url in context
+    assert not earnings.format_earnings_context([entry], ["MU"])
 
 
 def test_periodic_20f_uses_ifrs_and_preserves_currency(monkeypatch):
@@ -183,4 +169,4 @@ def test_periodic_20f_uses_ifrs_and_preserves_currency(monkeypatch):
     assert result.period == earnings.Period("annual", date(2025, 12, 31))
     assert result.measures[("revenue", "IFRS")].currency == "EUR"
     assert result.measures[("eps", "IFRS")].value == Decimal("1.23")
-    assert "[20-F z 2026-04-15]" in earnings.render_earnings([result])
+    assert "zgłoszono 2026-04-15" in earnings.format_earnings_context([result], ["FOREIGN"])

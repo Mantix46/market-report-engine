@@ -206,6 +206,7 @@ class SecScan:
     filings: list[Filing] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     _state_path: Path | None = field(default=None, repr=False)
+    weekly_filings: list[Filing] = field(default_factory=list)
 
     def acknowledge(self) -> bool:
         """Mark the filings included in this scan as sent after SMTP succeeds."""
@@ -484,6 +485,7 @@ def _poll_sec(tickers: list[str], path: Path, persist: bool) -> SecScan:
     tickers = _normalize_tickers(tickers)
     valid_tickers = [ticker for ticker in tickers if _valid_ticker(ticker)]
     ciks = {}
+    weekly = {}
     if len(valid_tickers) != len(tickers):
         scan.warnings.append("Pominięto symbole SEC w nieprawidłowym formacie.")
     if valid_tickers:
@@ -517,12 +519,15 @@ def _poll_sec(tickers: list[str], path: Path, persist: bool) -> SecScan:
                 if window.through:
                     start = max(start, window.through - timedelta(days=_OVERLAP_DAYS - 1))
                 try:
-                    filings, complete = _submissions(ticker, cik, start, today)
+                    filings, complete = _submissions(ticker, cik, min(start, bootstrap), today)
                 except SecError as exc:
                     scan.warnings.append(f"{ticker}: {exc}")
                     continue
                 for filing in filings:
-                    if filing.accession not in state.reported:
+                    filed = date.fromisoformat(filing.filing_date)
+                    if filed >= bootstrap:
+                        weekly.setdefault(filing.accession, filing)
+                    if filed >= start and filing.accession not in state.reported:
                         state.pending.setdefault(filing.accession, filing)
                 if complete:
                     window.through = max(window.through or today, today)
@@ -542,6 +547,10 @@ def _poll_sec(tickers: list[str], path: Path, persist: bool) -> SecScan:
         elif filing.cik in ciks:
             active.append(replace(filing, ticker=ciks[filing.cik][0]))
     scan.filings = sorted(active, key=lambda row: (row.filing_date, row.accepted_at, row.accession), reverse=True)
+    # Weekly analysis also needs filings already delivered in a daily report.
+    scan.weekly_filings = sorted(
+        weekly.values(), key=lambda row: (row.filing_date, row.accepted_at, row.accession), reverse=True,
+    )
     if scan.warnings:
         logger.warning("SEC EDGAR: %d ostrzeżeń podczas odczytu. Szczegóły dostępne w raporcie.", len(scan.warnings))
     return scan

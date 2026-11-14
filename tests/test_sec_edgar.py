@@ -67,7 +67,9 @@ def test_preview_leaves_state_unchanged_and_deduplicates_accession(sec_feed, tmp
     assert path.read_bytes() == before
 
     assert poll.acknowledge()
-    assert sec_edgar.poll_sec(["NBIS"], state_path=path, persist=True).filings == []
+    next_scan = sec_edgar.poll_sec(["NBIS"], state_path=path, persist=True)
+    assert next_scan.filings == []
+    assert [filing.accession for filing in next_scan.weekly_filings] == [ACCESSION]
     state = json.loads(path.read_text(encoding="utf-8"))
     assert state["pending"] == {}
     assert state["reported"] == [ACCESSION]

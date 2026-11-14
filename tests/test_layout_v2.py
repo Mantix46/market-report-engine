@@ -98,7 +98,8 @@ def test_benchmarks_table(sample_data):
     assert "| **WIG20** | b/d | b/d | b/d | b/d |" in md
 
 
-def test_ai_and_basic_reports_render_verified_earnings_and_sentiment(sample_data, monkeypatch):
+@pytest.mark.parametrize("saturday", [False, True])
+def test_earnings_are_used_only_in_saturday_forecast(sample_data, monkeypatch, saturday):
     day = sample_data["now"].date()
     source = "https://www.sec.gov/Archives/edgar/data/723125/"
     entry = Earnings("MU", Period("quarter", day))
@@ -106,27 +107,56 @@ def test_ai_and_basic_reports_render_verified_earnings_and_sentiment(sample_data
         "revenue", "GAAP", "USD", Decimal("2500000000"), source, Decimal("2000000000"),
     )
     sample_data.update(
+        is_saturday=saturday,
+        persist=False,
         earnings=[entry],
         sec_scan=SecScan(),
-        market_sentiment={"ofr_fsi": None, "cftc_sp500": None},
+        market_sentiment={
+            "ofr_fsi": {"value": -1.95, "date": day, "change": None, "previous_date": None, "is_stale": False},
+            "cftc_sp500": None,
+        },
+        current_prices={"MU": 100, "XTB.WA": 70},
+        prediction_evaluation={"new": []},
+        prediction_feedback={"summary": "b/d"},
     )
+    prompts = []
+    forecasts = "\n".join([
+        layout_v2.PREDICTIONS_HEADER,
+        "- MU: kierunek=up; horyzont=5 sesji; teza=malejący stres sprzyja popytowi na akcje.",
+        "- XTB.WA: kierunek=neutral; horyzont=5 sesji; teza=brak przewagi sygnałów.",
+    ])
 
     def gemini(prompt, api_key):
-        assert "E1-revenue-GAAP" in prompt
+        prompts.append(prompt)
         assert api_key == "mock-key"
         sections = "\n\n".join(f"{heading}\nTreść" for heading in layout_v2.V2_AI_HEADERS)
-        return sections + '\n<earnings_selection>{"good":["E1-revenue-GAAP"],"risk":[]}</earnings_selection>'
+        if len(prompts) == 2:
+            return forecasts.replace("malejący stres sprzyja popytowi na akcje",
+                                     "mocniejsze wyniki mogą poprawić oczekiwania inwestorów")
+        if saturday:
+            sections += f"\n\n{layout_v2.PREDICTION_REVIEW_HEADER}\nBrak rozliczeń.\n\n{forecasts}"
+        return sections
 
     monkeypatch.setattr(layout_v2, "_call_gemini_v2", gemini)
-    for report in (
-        layout_v2.render_ai_report_v2(sample_data, "mock-key"),
-        layout_v2.render_basic_report_v2(sample_data),
-    ):
-        assert report.index("## SEC EDGAR") < report.index("## Wyniki spółek")
-        assert "**Bardzo dobre** • Przychody (GAAP) 2,5 mld USD" in report
-        assert f"[SEC]({source})" in report
+    ai_report = layout_v2.render_ai_report_v2(sample_data, "mock-key")
+    for report in (ai_report, layout_v2.render_basic_report_v2(sample_data)):
+        assert "## SEC EDGAR" in report
+        assert "## Wyniki spółek" not in report
+        assert "2,5 mld USD" not in report
         assert report.index("## 9. Sentyment") < report.index("OFR Financial Stress Index")
-        assert "<earnings_selection>" not in report
+    assert len(prompts) == (2 if saturday else 1)
+    assert all("OFR Financial Stress Index" in prompt and "CFTC COT" in prompt for prompt in prompts)
+    assert "2,5 mld USD" not in prompts[0]
+    if saturday:
+        assert "2,5 mld USD" in prompts[1]
+        body, forecast_section = ai_report.split(layout_v2.PREDICTIONS_HEADER, 1)
+        expected = "mocniejsze wyniki mogą poprawić oczekiwania inwestorów"
+        assert expected not in body and expected in forecast_section
+        monkeypatch.setattr(layout_v2, "_call_gemini_v2", lambda *_: forecasts.replace(
+            "malejący stres", "przychody 2,5 mld USD",
+        ))
+        section, _ = layout_v2._weekly_forecasts(sample_data, forecasts, "mock-key")
+        assert section == forecasts
 
 
 def test_macro_section_emoji_and_today_prefix(sample_data):

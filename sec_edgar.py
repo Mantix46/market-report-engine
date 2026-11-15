@@ -201,6 +201,10 @@ class Filing:
     url: str
 
 
+def _filing_order(filing: Filing) -> tuple[str, str, str]:
+    return filing.filing_date, filing.accepted_at, filing.accession
+
+
 @dataclass
 class SecScan:
     filings: list[Filing] = field(default_factory=list)
@@ -546,11 +550,13 @@ def _poll_sec(tickers: list[str], path: Path, persist: bool) -> SecScan:
             active.append(filing)
         elif filing.cik in ciks:
             active.append(replace(filing, ticker=ciks[filing.cik][0]))
-    scan.filings = sorted(active, key=lambda row: (row.filing_date, row.accepted_at, row.accession), reverse=True)
+    scan.filings = sorted(active, key=_filing_order, reverse=True)
     # Weekly analysis also needs filings already delivered in a daily report.
-    scan.weekly_filings = sorted(
-        weekly.values(), key=lambda row: (row.filing_date, row.accepted_at, row.accession), reverse=True,
-    )
+    if valid_tickers:
+        for filing in active:
+            if bootstrap <= date.fromisoformat(filing.filing_date) <= today:
+                weekly.setdefault(filing.accession, filing)
+    scan.weekly_filings = sorted(weekly.values(), key=_filing_order, reverse=True)
     if scan.warnings:
         logger.warning("SEC EDGAR: %d ostrzeżeń podczas odczytu. Szczegóły dostępne w raporcie.", len(scan.warnings))
     return scan
@@ -560,51 +566,137 @@ def _markdown(value: str) -> str:
     return re.sub(r"([\\`*_{}\[\]<>])", r"\\\1", " ".join(value.split()))
 
 
-_FORM_DESCRIPTIONS = {
-    "3": "pierwotny stan posiadania insidera",
-    "4": "zmiana stanu posiadania insidera",
-    "5": "roczne zgłoszenie insidera",
-    "6-K": "bieżące informacje emitenta zagranicznego",
-    "8-K": "raport bieżący",
-    "10-K": "raport roczny",
-    "10-Q": "raport kwartalny",
-    "11-K": "roczny raport pracowniczego planu oszczędnościowego",
-    "20-F": "raport emitenta zagranicznego",
-    "40-F": "raport emitenta kanadyjskiego",
-    "144": "zawiadomienie o zamiarze sprzedaży papierów wartościowych",
-    "DEF 14A": "materiały dla akcjonariuszy przed głosowaniem",
-    "PRE 14A": "wstępne materiały dla akcjonariuszy przed głosowaniem",
-    "S-1": "rejestracja oferty papierów wartościowych",
-    "S-3": "uproszczona rejestracja oferty papierów wartościowych",
-    "SCHEDULE 13D": "zgłoszenie znacznego udziału z informacją o zamiarach inwestora",
-    "SCHEDULE 13G": "uproszczone zgłoszenie znacznego udziału",
-    "SC 13D": "zgłoszenie znacznego udziału z informacją o zamiarach inwestora",
-    "SC 13G": "uproszczone zgłoszenie znacznego udziału",
+_FORM_TOPICS = {
+    "3": "Pierwotny stan posiadania insiderów",
+    "4": "Zgłoszone zmiany stanu posiadania insiderów",
+    "5": "Roczne zgłoszenia insiderów",
+    "6-K": "Bieżące informacje emitenta zagranicznego",
+    "8-K": "Pozostałe raporty bieżące",
+    "10-K": "Raporty roczne",
+    "10-Q": "Raporty kwartalne",
+    "11-K": "Raporty pracowniczego planu oszczędnościowego",
+    "20-F": "Raporty roczne emitenta zagranicznego",
+    "40-F": "Raporty roczne emitenta kanadyjskiego",
+    "144": "Zawiadomienia o zamiarze sprzedaży papierów wartościowych",
+    "DEF 14A": "Materiały dla akcjonariuszy przed głosowaniem",
+    "PRE 14A": "Wstępne materiały dla akcjonariuszy przed głosowaniem",
+    "S-1": "Rejestracja oferty papierów wartościowych",
+    "S-3": "Uproszczona rejestracja oferty papierów wartościowych",
+    "F-1": "Rejestracja oferty emitenta zagranicznego",
+    "F-3": "Uproszczona rejestracja oferty emitenta zagranicznego",
+    "SCHEDULE 13D": "Zgłoszenia znacznego udziału i zamiarów inwestora",
+    "SCHEDULE 13G": "Uproszczone zgłoszenia znacznego udziału",
+}
+
+_PERIODIC_FORMS = {"10-K", "10-Q", "11-K", "20-F", "40-F"}
+_8K_TOPICS = {
+    "1.01": "Zawarcie istotnej umowy",
+    "1.02": "Rozwiązanie istotnej umowy",
+    "1.03": "Upadłość lub postępowanie zarządcze",
+    "1.05": "Istotny incydent cyberbezpieczeństwa",
+    "2.01": "Zakończone przejęcie lub zbycie aktywów",
+    "2.02": "Wyniki i sytuacja finansowa",
+    "2.03": "Nowe zobowiązania finansowe lub pozabilansowe",
+    "2.04": "Zdarzenia zwiększające lub przyspieszające wymagalność zobowiązań",
+    "2.05": "Koszty zamknięcia lub zbycia działalności",
+    "2.06": "Istotne odpisy z tytułu utraty wartości",
+    "3.01": "Zmiana notowań lub kwestia zgodności z wymogami giełdy",
+    "3.02": "Sprzedaż akcji bez rejestracji oferty",
+    "3.03": "Istotna zmiana praw posiadaczy papierów wartościowych",
+    "4.01": "Zmiana audytora",
+    "4.02": "Zastrzeżenia do wiarygodności wcześniejszych sprawozdań lub opinii audytora",
+    "5.01": "Zmiana kontroli nad spółką",
+    "5.02": "Zmiany w organach spółki lub warunkach wynagradzania kadry",
+    "5.03": "Zmiana dokumentów założycielskich, statutu lub roku obrotowego",
+    "5.07": "Wyniki głosowania akcjonariuszy",
 }
 
 
-def _form_description(form: str) -> str:
-    if form.endswith("/A"):
-        return f"korekta · {_form_description(form[:-2])}"
-    return _FORM_DESCRIPTIONS.get(form, "zgłoszenie SEC")
+def _base_form(filing: Filing) -> str:
+    form = filing.form.upper().removesuffix("/A")
+    if form in ("SC 13D", "SC 13G"):
+        return form.replace("SC ", "SCHEDULE ", 1)
+    return form
 
 
-def render_sec(scan: SecScan) -> str:
-    """Render all pending filings as a concise section with official source links."""
+def _topics(filing: Filing) -> list[str]:
+    form = _base_form(filing)
+    if form == "8-K":
+        topics = list(dict.fromkeys(_8K_TOPICS[item] for item in filing.items if item in _8K_TOPICS))
+        if topics:
+            return topics
+        if "7.01" in filing.items:
+            return ["Komunikaty w trybie Regulation FD"]
+    return [_FORM_TOPICS.get(form, f"Inne zgłoszenia ({form})")]
+
+
+def _filing_count(count: int) -> str:
+    if count == 1:
+        return "1 zgłoszenie"
+    if count % 10 in (2, 3, 4) and count % 100 not in (12, 13, 14):
+        return f"{count} zgłoszenia"
+    return f"{count} zgłoszeń"
+
+
+def _representative_link(filing: Filing) -> str:
+    return f"[EDGAR · {_markdown(filing.form)}]({filing.url})"
+
+
+def _topic_summary(topic: str, filings: list[Filing], *, link: bool) -> str:
+    latest = filings[0]
+    earliest = filings[-1].filing_date
+    dates = latest.filing_date if earliest == latest.filing_date else f"{earliest} – {latest.filing_date}"
+    details = [_filing_count(len(filings)), dates]
+    periods = sorted({filing.report_date for filing in filings if _base_form(filing) in _PERIODIC_FORMS and filing.report_date})
+    if periods:
+        details.append(f"Koniec okresu {', '.join(periods)}")
+    amendments = sum(filing.form.upper().endswith("/A") for filing in filings)
+    if amendments:
+        details.append(f"korekty {amendments}")
+    if link:
+        details.append(_representative_link(latest))
+    return f"- **{_markdown(topic)}** · " + " · ".join(details)
+
+
+def render_sec(scan: SecScan, *, earnings_accessions: set[str] | None = None) -> str:
+    """Summarize the last seven SEC filing dates by company and topic."""
     lines = ["## SEC EDGAR", ""]
-    if not scan.filings and not scan.warnings:
-        lines.append("Brak nowych zgłoszeń.")
+    weekly = {filing.accession: filing for filing in scan.weekly_filings}
+    companies = {}
+    for filing in sorted(weekly.values(), key=_filing_order, reverse=True):
+        companies.setdefault(filing.ticker, []).append(filing)
+    if companies:
+        lines.append("Ostatnie 7 dni według dat zgłoszeń w SEC.")
+    elif not scan.warnings:
+        lines.append("Brak zgłoszeń z ostatnich 7 dni.")
+    for ticker, filings in sorted(companies.items()):
+        lines.extend(["", f"### {_markdown(ticker)} · {_filing_count(len(filings))}", ""])
+        grouped = {}
+        for filing in filings:
+            topics = (
+                ["Publikacje wynikowe emitenta zagranicznego"]
+                if earnings_accessions and filing.accession in earnings_accessions and _base_form(filing) == "6-K"
+                else _topics(filing)
+            )
+            for topic in topics:
+                grouped.setdefault(topic, []).append(filing)
+        linked = set()
+        for topic, group in grouped.items():
+            accession = group[0].accession
+            lines.append(_topic_summary(topic, group, link=accession not in linked))
+            linked.add(accession)
+
+    backlog = {}
     for filing in scan.filings:
-        details = f" · {_form_description(filing.form)}"
-        if filing.report_date and filing.report_date != filing.filing_date:
-            details += f" · data raportu {filing.report_date}"
-        if filing.items:
-            details += f" · pozycje {_markdown(', '.join(filing.items))}"
-        lines.append(
-            f"- **{_markdown(filing.ticker)} · {_markdown(filing.form)}** · {filing.filing_date}{details} · [EDGAR]({filing.url})"
-        )
+        if filing.accession not in weekly:
+            backlog.setdefault(filing.ticker, []).append(filing)
+    if backlog:
+        lines.extend(["", "### Starsze zgłoszenia oczekujące na wysyłkę", ""])
+        for ticker, filings in sorted(backlog.items()):
+            latest = max(filings, key=_filing_order)
+            lines.append(f"- **{_markdown(ticker)}** · {_filing_count(len(filings))} · {_representative_link(latest)}")
     if scan.warnings:
-        if scan.filings:
+        if companies or backlog:
             lines.append("")
         lines.extend(f"- {_markdown(warning)}" for warning in scan.warnings)
     return "\n".join(lines)

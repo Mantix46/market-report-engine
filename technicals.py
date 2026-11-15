@@ -180,6 +180,8 @@ def _empty_technicals() -> dict:
         "bollinger_position": None,
         "bollinger_bandwidth": None,
         "bollinger_signal": None,
+        "data_date": None,
+        "price_breakouts": [],
         # --- Wskaźniki trendu ---
         "ema_20": None,
         "ema_50": None,
@@ -199,13 +201,41 @@ def _empty_technicals() -> dict:
     }
 
 
+def _price_breakouts(close: pd.Series) -> list[dict]:
+    """Wybicia z ostatnich pięciu sesji na podstawie zaobserwowanych cen."""
+    close = close.iloc[-55:]
+    distance_sma50 = (close - close.rolling(50).mean()).iloc[-6:]
+    distance_sma50 = distance_sma50.mask(np.isclose(distance_sma50, 0), 0)
+    window_20 = close.rolling(20)
+    band_width = 2 * window_20.std().iloc[-6:]
+    distance_band_center = (close - window_20.mean()).iloc[-6:]
+    distance_upper = (distance_band_center - band_width).where(band_width > 0)
+    distance_lower = (distance_band_center + band_width).where(band_width > 0)
+    crossed_levels = {
+        "Wybicie ponad SMA50": (distance_sma50.shift(1) < 0) & (distance_sma50 > 0),
+        "Spadek poniżej SMA50": (distance_sma50.shift(1) > 0) & (distance_sma50 < 0),
+        "Wybicie ponad górną wstęgę Bollingera": (distance_upper.shift(1) <= 0) & (distance_upper > 0),
+        "Spadek pod dolną wstęgę Bollingera": (distance_lower.shift(1) >= 0) & (distance_lower < 0),
+    }
+    return [
+        {"date": str(session.date()), "signal": signal}
+        for session in reversed(distance_sma50.index[1:])
+        for signal, crossed in crossed_levels.items()
+        if crossed.loc[session]
+    ]
+
+
 def fetch_technicals(ticker: str) -> dict:
     """Calculate RSI, SMA, MACD, Bollinger Bands and trend indicators from price history."""
     try:
         t = yf.Ticker(ticker)
         # 2 lata historii — potrzebne dla SMA200 / EMA200 i wygrzania wskaźników trendu
-        hist = clean_history(ticker, t.history(period="2y"), t)
-        if hist.empty or len(hist) < 14:
+        raw_history = t.history(period="2y")
+        if len(raw_history) < 14:
+            return _empty_technicals()
+        original_close = raw_history["Close"].iloc[-55:].copy()
+        hist = clean_history(ticker, raw_history, t)
+        if len(hist) < 14:
             return _empty_technicals()
 
         close = hist["Close"]
@@ -326,6 +356,8 @@ def fetch_technicals(ticker: str) -> dict:
             "bollinger_position": round(bollinger_position, 2) if bollinger_position is not None and not pd.isna(bollinger_position) else None,
             "bollinger_bandwidth": round(bollinger_bandwidth, 2) if bollinger_bandwidth is not None and not pd.isna(bollinger_bandwidth) else None,
             "bollinger_signal": bollinger_signal,
+            "data_date": str(hist.index[-1].date()),
+            "price_breakouts": _price_breakouts(original_close),
             # --- Wskaźniki trendu ---
             "ema_20": round(ema_20, 2) if ema_20 is not None else None,
             "ema_50": round(ema_50, 2) if ema_50 is not None else None,

@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from datetime import date, datetime, timezone
 from unittest.mock import Mock
 
@@ -47,7 +48,7 @@ def test_no_filings_is_distinct_from_failure(sec_feed, tmp_path):
 
     assert scan.filings == []
     assert scan.warnings == []
-    assert "Brak nowych zgłoszeń" in sec_edgar.render_sec(scan)
+    assert "Brak zgłoszeń z ostatnich 7 dni" in sec_edgar.render_sec(scan)
     state = json.loads(path.read_text(encoding="utf-8"))
     assert date.fromisoformat(state["coverage"]["0001513845"]["through"]) == date(2026, 11, 14)
 
@@ -70,6 +71,7 @@ def test_preview_leaves_state_unchanged_and_deduplicates_accession(sec_feed, tmp
     next_scan = sec_edgar.poll_sec(["NBIS"], state_path=path, persist=True)
     assert next_scan.filings == []
     assert [filing.accession for filing in next_scan.weekly_filings] == [ACCESSION]
+    assert sec_edgar._filing_url("0001513845", ACCESSION) in sec_edgar.render_sec(next_scan)
     state = json.loads(path.read_text(encoding="utf-8"))
     assert state["pending"] == {}
     assert state["reported"] == [ACCESSION]
@@ -108,9 +110,56 @@ def test_failed_poll_keeps_pending_and_does_not_advance_coverage(sec_feed, monke
     scan = sec_edgar.poll_sec(["NBIS"], state_path=path, persist=True)
 
     assert scan.filings == first.filings
+    assert scan.weekly_filings == first.filings
     assert scan.warnings == ["NBIS: SEC HTTP 503"]
-    assert "Brak nowych zgłoszeń" not in sec_edgar.render_sec(scan)
+    assert "Brak zgłoszeń" not in sec_edgar.render_sec(scan)
     assert path.read_bytes() == before
+
+
+def test_outage_does_not_add_older_pending_filings_to_the_week(sec_feed, monkeypatch, tmp_path):
+    path = tmp_path / "sec.json"
+    older = "0001104659-26-126007"
+    sec_feed[SUBMISSIONS] = submission([older, ACCESSION])
+    sec_feed[SUBMISSIONS]["filings"]["recent"]["filingDate"][0] = "2026-11-07"
+
+    class PreviousDay(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 11, 13, 12, tzinfo=timezone.utc).astimezone(tz)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sec_edgar, "datetime", PreviousDay)
+        sec_edgar.poll_sec(["NBIS"], state_path=path, persist=True)
+    monkeypatch.setattr(sec_edgar, "_sec_json", Mock(side_effect=sec_edgar.SecError("SEC HTTP 503")))
+    scan = sec_edgar.poll_sec(["NBIS"], state_path=path, persist=True)
+
+    assert {filing.accession for filing in scan.filings} == {older, ACCESSION}
+    assert [filing.accession for filing in scan.weekly_filings] == [ACCESSION]
+    weekly, backlog = sec_edgar.render_sec(scan).split("### Starsze zgłoszenia")
+    assert sec_edgar._filing_url("0001513845", ACCESSION) in weekly
+    assert sec_edgar._filing_url("0001513845", older) in backlog
+
+
+def test_weekly_render_groups_by_company_and_topic_with_representative_links(sec_feed, tmp_path):
+    latest, = sec_edgar.poll_sec(["NBIS"], state_path=tmp_path / "sec.json").weekly_filings
+    latest = replace(latest, form="8-K", items=("1.01", "2.03", "9.01"))
+    prior = replace(latest, accession="prior", url="https://www.sec.gov/prior", form="8-K/A",
+                    filing_date="2026-11-09", items=("1.01",))
+    ownership = replace(latest, accession="ownership", url="https://www.sec.gov/ownership", form="4", items=())
+    intention = replace(latest, accession="intention", url="https://www.sec.gov/intention", form="144", items=())
+    periodic = replace(latest, ticker="MU", accession="periodic", url="https://www.sec.gov/periodic",
+                       form="10-Q", items=())
+    md = sec_edgar.render_sec(sec_edgar.SecScan(weekly_filings=[prior, latest, ownership, intention, periodic, latest]))
+
+    assert md.count("### NBIS · 4 zgłoszenia") == 1
+    assert md.count("### MU · 1 zgłoszenie") == 1
+    assert "Zawarcie istotnej umowy** · 2 zgłoszenia · 2026-11-09 – 2026-11-12 · korekty 1" in md
+    assert "Nowe zobowiązania finansowe lub pozabilansowe** · 1 zgłoszenie" in md
+    assert "Zgłoszone zmiany stanu posiadania insiderów" in md
+    assert "Zawiadomienia o zamiarze sprzedaży papierów wartościowych" in md
+    assert "Raporty kwartalne** · 1 zgłoszenie · 2026-11-12 · Koniec okresu 2026-09-30" in md
+    assert md.count(latest.url) == 1
+    assert prior.url not in md
 
 
 def test_invalid_contact_stays_local_and_returns_warning(monkeypatch, tmp_path):

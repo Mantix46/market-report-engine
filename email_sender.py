@@ -5,6 +5,7 @@ Konwertuje raport markdown → HTML z profesjonalnym stylem,
 wysyła przez SMTP (Gmail/Outlook).
 """
 
+import re
 import smtplib
 import ssl
 import markdown
@@ -128,11 +129,8 @@ EMAIL_CSS = """
 """
 
 
-import re
-
 def colorize_percentages(html: str) -> str:
-    """Koloruje wartości procentowe: zielone dla +, czerwone dla -.
-    Wartości ±0.00% zostają bez koloru (ruch neutralny)."""
+    """Koloruje podpisane zmiany w tekście, z pominięciem atrybutów HTML."""
     def replace_pct(match):
         value = match.group(0)
         try:
@@ -144,7 +142,25 @@ def colorize_percentages(html: str) -> str:
             return f'<span style="color: #7ee787; font-weight: 600;">{value}</span>'
         return f'<span style="color: #f85149; font-weight: 600;">{value}</span>'
 
-    return re.sub(r'[+-]\d+(?:\.\d+)?%', replace_pct, html)
+    return "".join(
+        fragment if fragment.startswith("<") else re.sub(r'[+-]\d+(?:\.\d+)?%', replace_pct, fragment)
+        for fragment in re.split(r'(<[^>]*>)', html)
+    )
+
+
+def _colorize_report_sections(html: str) -> str:
+    # Podsumowanie i prognozy zawierają także neutralne poziomy, wskaźniki i odczyty sentymentu.
+    # W tych sekcjach kolor, jeśli występuje, nadaje renderer na podstawie rodzaju wartości.
+    neutral_sections = {"1. Executive Summary", "9. Sentyment", "Prognozy do weryfikacji"}
+    sections = re.split(r"(?=<h2>)", html)
+    result = []
+    for section in sections:
+        heading = re.match(r"<h2>([^<]+)</h2>", section)
+        if heading and heading.group(1) in neutral_sections:
+            result.append(section)
+        else:
+            result.append(colorize_percentages(section))
+    return "".join(result)
 
 
 def markdown_to_html(md_content: str) -> str:
@@ -157,7 +173,7 @@ def markdown_to_html(md_content: str) -> str:
     )
     
     # Kolorowanie zmian procentowych
-    html_body = colorize_percentages(html_body)
+    html_body = _colorize_report_sections(html_body)
     
     # Pełny HTML document
     html = f"""<!DOCTYPE html>

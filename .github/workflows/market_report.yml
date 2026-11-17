@@ -53,7 +53,7 @@ jobs:
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
           SEC_CONTACT_EMAIL: ${{ secrets.SEC_CONTACT_EMAIL || vars.SEC_CONTACT_EMAIL }}
-          SEC_TICKERS: ${{ vars.SEC_TICKERS || 'NBIS,MU,FPS,AAOI,AVGO' }}
+          SEC_TICKERS: ${{ vars.SEC_TICKERS }}
         run: |
           set -euo pipefail
           cp private-input/{watchlists.json,daily_snapshots.csv,prediction_tracker.csv} .

@@ -12,7 +12,7 @@ from data_fetching import (
     TICKER_NAMES, MACRO_TICKERS, GPW_NEWS_QUERIES,
     US_BENCHMARK, PL_BENCHMARK,
     fetch_nasdaq100_tickers, fetch_quote_cached, fetch_quotes_batch, get_top_movers,
-    fetch_fundamentals_short_insider, fetch_earnings_dates,
+    fetch_fundamentals_short_insider, fetch_earnings_dates, fetch_analyst_recommendations,
     fetch_macro_calendar, fetch_earnings_call_context
 )
 
@@ -25,6 +25,7 @@ from snapshot_store import load_last_snapshots, save_today_snapshots
 from market_calendar import market_status, warsaw_now
 from sec_edgar import SecScan, configured_sec_tickers, poll_sec
 from earnings_report import collect_earnings
+from sec_monitoring import collect_sec_monitoring
 from guidance_consensus import load_guidance_estimates, refresh_guidance_estimates
 from market_sentiment import collect_market_sentiment
 
@@ -264,6 +265,8 @@ def collect_report_data(persist_state: bool = True) -> dict:
                 f"(próg: {MIN_DATA_QUALITY:.0%}). Prawdopodobna awaria źródła danych (yfinance)."
             )
 
+    analyst_recs = {ticker: fetch_analyst_recommendations(ticker) for ticker in active_tickers}
+
     # 3. Top movers (tylko otwarte rynki)
     logger.info("Obliczam top movers (NASDAQ-100 i GPW-100)...")
     radar_us = fetch_nasdaq100_tickers() if us_active else []
@@ -357,6 +360,7 @@ def collect_report_data(persist_state: bool = True) -> dict:
         "macro_calendar": macro_calendar,
         "today_movers": today_movers,
         "earnings_dates": earnings_dates,
+        "analyst_recs": analyst_recs,
         "earnings_call_context": earnings_call_context,
         "news_data": news_data,
         "last_snapshots": last_snapshots,
@@ -500,6 +504,10 @@ def _collect_enrichments(data: dict, sec_scan: Optional[SecScan], persist_state:
     })
     active_tickers = set(data.get("active_tickers") or [])
     data["monitoring_filings"] = [filing for filing in recent.values() if filing.ticker in active_tickers]
+    data["sec_documents"], data["sec_insider_trades"] = collect_sec_monitoring(
+        data["monitoring_filings"],
+        [filing for filing in scan.weekly_filings if filing.ticker in active_tickers],
+    )
     is_saturday = data.get("is_saturday", False)
     filings = scan.weekly_filings if is_saturday else data["monitoring_filings"]
     estimates = load_guidance_estimates() if is_saturday or filings or persist_state else []

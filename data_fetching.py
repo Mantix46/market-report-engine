@@ -244,7 +244,7 @@ class TickerCache:
         
         if uncached:
             fetched = {}
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
                 future_to_ticker = {executor.submit(self.fetch, t, period): t for t in uncached}
                 for future in concurrent.futures.as_completed(future_to_ticker):
                     t = future_to_ticker[future]
@@ -449,6 +449,8 @@ def fetch_analyst_recommendations(ticker: str) -> dict:
     except Exception as e:
         logger.debug(f"Brak upgrades_downgrades dla {ticker}: {e}")
 
+    if out["rec_summary"] is None and out["price_targets"] is None:
+        logger.warning("Rekomendacje %s: Yahoo Finance nie zwróciło rozkładu ocen ani celów cenowych.", ticker)
     time.sleep(0.3)  # rate limiting jak w fetch_earnings_dates
     return out
 
@@ -678,7 +680,11 @@ def fetch_fundamentals_short_insider(ticker: str) -> dict:
     """Fetch fundamentals, short interest and a richer insider/smart-money summary."""
     try:
         t = yf.Ticker(ticker)
-        info = t.info
+        try:
+            info = t.info or {}
+        except Exception as exc:
+            logger.warning("Wycena %s: odczyt Yahoo Finance nieudany (%s).", ticker, type(exc).__name__)
+            info = {}
 
         try:
             price = t.fast_info.get("lastPrice")

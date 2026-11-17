@@ -94,7 +94,7 @@ def test_monitoring_fallback_surfaces_company_facts_and_estimates():
 
     report = layout_v2._basic_monitoring(data)
     assert "5 sesji: +2.30%" in report
-    assert "marża operacyjna 21.0%" in report
+    assert "marża operacyjna" not in report and "EBITDA" not in report
     assert "szacunki analityków" in report
     assert "Szacowany termin wyników wg Yahoo Finance · od 2026-07-18" in report
     assert "SMA50" not in report and "RSI" not in report

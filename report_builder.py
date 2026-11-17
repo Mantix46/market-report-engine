@@ -479,15 +479,40 @@ def _fmt_portfolio_block(portfolio_details: dict) -> str:
 
 def _collect_enrichments(data: dict, sec_scan: Optional[SecScan], persist_state: bool) -> None:
     data["sec_scan"] = sec_scan if sec_scan is not None else scan_watchlist(persist=False)
+    scan = data["sec_scan"]
+    today = data["now"].date()
+    previous_report = today - timedelta(days=1)
+    while previous_report.weekday() in (0, 6) or (
+        previous_report.weekday() != 5
+        and not any(status["open"] for status in market_status(previous_report).values())
+    ):
+        previous_report -= timedelta(days=1)
+    # The morning report also covers filings posted after the preceding report.
+    recent = {
+        filing.accession: filing
+        for filing in scan.filings
+        if previous_report.isoformat() <= filing.filing_date <= today.isoformat()
+    }
+    recent.update({
+        filing.accession: filing
+        for filing in scan.weekly_filings
+        if filing.filing_date == today.isoformat()
+    })
+    active_tickers = set(data.get("active_tickers") or [])
+    data["monitoring_filings"] = [filing for filing in recent.values() if filing.ticker in active_tickers]
     is_saturday = data.get("is_saturday", False)
-    estimates = load_guidance_estimates() if is_saturday or persist_state else []
-    if is_saturday:
+    filings = scan.weekly_filings if is_saturday else data["monitoring_filings"]
+    estimates = load_guidance_estimates() if is_saturday or filings or persist_state else []
+    if is_saturday or filings:
         try:
-            data["earnings"] = collect_earnings(data["sec_scan"].weekly_filings, guidance_estimates=estimates)
+            data["earnings"] = collect_earnings(filings, guidance_estimates=estimates)
         except Exception as exc:
             logger.warning("Wyniki SEC: nie udało się odczytać danych (%s).", type(exc).__name__)
             data["earnings"] = []
-            data["sec_scan"].warnings.append("Dane wynikowe SEC niedostępne dla sobotnich prognoz.")
+            notice = "Dane wynikowe SEC niedostępne dla sobotnich prognoz." if is_saturday else (
+                "Dane wynikowe SEC niedostępne dla monitoringu."
+            )
+            scan.warnings.append(notice)
     data["market_sentiment"] = collect_market_sentiment(data["now"].date())
     if persist_state:
         refresh_guidance_estimates(configured_sec_tickers(US_TICKERS), estimates)

@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import date, datetime, timezone
 from unittest.mock import Mock
 
@@ -120,6 +121,24 @@ def test_guidance_snapshot_keeps_future_estimates_with_explicit_capture_time():
         "basis": "reported", "currency": "USD", "value": 34000000000,
         "captured_at": "2026-08-15T09:30:00+00:00", "source": guidance_consensus.SOURCE,
     }]
+
+
+def test_monitoring_includes_filings_since_previous_report(monkeypatch):
+    filing = Filing("NBIS", "0001513845", "0001104659-26-126008", "6-K", "2026-11-16",
+                    "", "", (), "release.htm", "https://www.sec.gov/")
+    today = replace(filing, accession="0001104659-26-126009", filing_date="2026-11-17")
+    older = replace(filing, accession="0001104659-26-126007", filing_date="2026-11-13")
+    scan = SecScan(filings=[filing, older], weekly_filings=[today, filing, older])
+    data = {"now": datetime(2026, 11, 17, 7, 30), "active_tickers": ["NBIS"]}
+    collect = Mock(return_value=[])
+    monkeypatch.setattr(report_builder, "collect_earnings", collect)
+    monkeypatch.setattr(report_builder, "load_guidance_estimates", list)
+    monkeypatch.setattr(report_builder, "collect_market_sentiment", Mock(return_value={}))
+
+    report_builder._collect_enrichments(data, scan, persist_state=False)
+
+    assert data["monitoring_filings"] == [filing, today]
+    collect.assert_called_once_with([filing, today], guidance_estimates=[])
 
 
 @pytest.mark.parametrize("earnings_failure", [False, True])

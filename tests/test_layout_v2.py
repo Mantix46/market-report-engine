@@ -3,12 +3,15 @@
 import os
 import sys
 from datetime import datetime
+from decimal import Decimal
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import layout_v2  # noqa: E402
+from earnings_report import Earnings, Measure, Period
+from sec_edgar import Filing, SecScan
 
 
 @pytest.fixture
@@ -95,6 +98,93 @@ def test_benchmarks_table(sample_data):
     assert "| **WIG20** | b/d | b/d | b/d | b/d |" in md
 
 
+@pytest.mark.parametrize("saturday", [False, True])
+def test_earnings_are_used_only_in_saturday_forecast(sample_data, monkeypatch, saturday):
+    day = sample_data["now"].date()
+    source = "https://www.sec.gov/Archives/edgar/data/723125/"
+    filing = Filing("MU", "0000723125", "0000723125-26-000001", "6-K", day.isoformat(),
+                    day.isoformat(), "", (), "results.htm", source)
+    entry = Earnings("MU", Period("quarter", day), filings=[filing])
+    entry.measures[("revenue", "GAAP")] = Measure(
+        "revenue", "GAAP", "USD", Decimal("2500000000"), source, Decimal("2000000000"),
+    )
+    sample_data.update(
+        is_saturday=saturday,
+        persist=False,
+        earnings=[entry] if saturday else [],
+        sec_scan=SecScan(weekly_filings=[filing]),
+        market_sentiment={
+            "ofr_fsi": {"value": -1.95, "date": day, "change": None, "previous_date": None, "is_stale": False},
+            "cftc_sp500": None,
+        },
+        current_prices={"MU": 100, "XTB.WA": 70},
+        prediction_evaluation={"new": []},
+        prediction_feedback={"summary": "b/d"},
+    )
+    prompts = []
+    forecasts = "\n".join([
+        layout_v2.PREDICTIONS_HEADER,
+        "- MU: kierunek=up; horyzont=5 sesji; teza=malejący stres sprzyja popytowi na akcje.",
+        "- XTB.WA: kierunek=neutral; horyzont=5 sesji; teza=brak przewagi sygnałów.",
+    ])
+
+    def gemini(prompt, api_key):
+        prompts.append(prompt)
+        assert api_key == "mock-key"
+        sections = "\n\n".join(f"{heading}\nTreść" for heading in layout_v2.V2_AI_HEADERS)
+        if len(prompts) == 2:
+            return forecasts.replace("malejący stres sprzyja popytowi na akcje",
+                                     "mocniejsze wyniki mogą poprawić oczekiwania inwestorów")
+        if saturday:
+            sections += f"\n\n{layout_v2.PREDICTION_REVIEW_HEADER}\nBrak rozliczeń.\n\n{forecasts}"
+        return sections
+
+    monkeypatch.setattr(layout_v2, "_call_gemini_v2", gemini)
+    ai_report = layout_v2.render_ai_report_v2(sample_data, "mock-key")
+    for report in (ai_report, layout_v2.render_basic_report_v2(sample_data)):
+        assert "## SEC EDGAR" in report
+        assert ("Publikacje wynikowe emitenta zagranicznego" in report) is saturday
+        assert "## Wyniki spółek" not in report
+        assert "2,5 mld USD" not in report
+        sentiment = report.split("## 9. Sentyment", 1)[1].split("## 10. Watchlist", 1)[0]
+        assert "OFR Financial Stress Index" in sentiment
+    assert len(prompts) == (2 if saturday else 1)
+    assert all("OFR Financial Stress Index" in prompt and "CFTC COT" in prompt for prompt in prompts)
+    assert "2,5 mld USD" not in prompts[0]
+    if saturday:
+        assert "2,5 mld USD" in prompts[1]
+        body, forecast_section = ai_report.split(layout_v2.PREDICTIONS_HEADER, 1)
+        expected = "mocniejsze wyniki mogą poprawić oczekiwania inwestorów"
+        assert expected not in body and expected in forecast_section
+        monkeypatch.setattr(layout_v2, "_call_gemini_v2", lambda *_: forecasts.replace(
+            "malejący stres", "przychody 2,5 mld USD",
+        ))
+        section, _ = layout_v2._weekly_forecasts(sample_data, forecasts, "mock-key")
+        assert section == forecasts
+
+
+def test_monitoring_uses_only_current_company_filings_and_reported_figures(sample_data):
+    day = sample_data["now"].date()
+    source = "https://www.sec.gov/Archives/edgar/data/723125/"
+    filing = Filing("MU", "0000723125", "0000723125-26-000001", "8-K", day.isoformat(),
+                    day.isoformat(), "", ("2.02",), "results.htm", source, "Quarterly results")
+    entry = Earnings("MU", Period("quarter", day), filings=[filing])
+    entry.measures[("revenue", "GAAP")] = Measure(
+        "revenue", "GAAP", "USD", Decimal("2500000000"), source,
+    )
+    sample_data.update(earnings=[entry], monitoring_filings=[])
+    assert "2,5 mld USD" not in layout_v2._company_data_block(sample_data)
+    assert "ROE" not in layout_v2._company_data_block(sample_data)
+    assert "szacunki analityków" in layout_v2._basic_monitoring(sample_data)
+
+    sample_data["monitoring_filings"] = [filing]
+    for section in (layout_v2._company_data_block(sample_data), layout_v2._basic_monitoring(sample_data)):
+        assert "SEC EDGAR" in section
+        assert "Wyniki i sytuacja finansowa" in section
+        assert "Quarterly results" in section
+        assert "2,5 mld USD" in section
+
+
 def test_macro_section_emoji_and_today_prefix(sample_data):
     md = layout_v2.build_macro_md(sample_data)
     assert md.startswith("## 3. Makroekonomia")
@@ -149,6 +239,7 @@ def test_valuation_table(sample_data):
     md = layout_v2.build_valuation_md(sample_data)
     assert "## 8. Wycena i technika" in md
     assert "| **MU** | 12.50 | b/d | 8.10 | 1.20 | 3.30 | 4.6% | 23.0% | 0.80 | 31.0% |" in md
+    assert "RSI 55.0 · vs SMA50 +2.0% · MACD wzrostowy" in md
     # spółka bez fundamentów -> b/d wszędzie, bez wyjątku
     assert "| **XTB.WA** | b/d |" in md
 
@@ -188,7 +279,7 @@ def test_parse_ai_sections_extended_headers():
 
 
 def test_saturday_basic_report(sample_data, monkeypatch):
-    """Sobota: raport regułowy zawiera analizę trendu, trafność i parsowalne prognozy."""
+    """Sobota: raport regułowy zawiera analizę trendu, trafność i czytelne prognozy."""
     sample_data["is_saturday"] = True
     sample_data["persist"] = False
     monkeypatch.setattr(layout_v2, "evaluate_previous_predictions", lambda dry_run: {"dry": dry_run})
@@ -214,10 +305,10 @@ def test_saturday_basic_report(sample_data, monkeypatch):
     assert md.find(layout_v2.PREDICTION_REVIEW_HEADER) < md.find("## Prognozy do weryfikacji")
     assert not saved  # persist=False -> brak zapisu prognoz
 
-    # format bulletów musi łapać prawdziwy parser accuracy_trackera
-    from accuracy_tracker import extract_predictions_from_report
-    parsed = extract_predictions_from_report(md, ["MU", "XTB.WA"], {"MU": 100.0})
-    assert len(parsed) == 1 and parsed[0]["ticker"] == "MU" and parsed[0]["direction"] == "up"
+    forecast = md.split(layout_v2.PREDICTIONS_HEADER, 1)[1]
+    assert "### MU" in forecast and "wzrost" in forecast
+    assert "RSI 55 przy trendzie wzrostowym" in forecast
+    assert "kierunek=" not in forecast
 
 
 def test_saturday_prompt_contains_feedback_and_upcoming_events(sample_data):

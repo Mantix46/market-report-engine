@@ -4,6 +4,13 @@ on:
   # Uruchomienie kontrolowane przez cron-job.org (POST workflow_dispatch)
   # lub ręcznie z poziomu strony GitHuba.
   workflow_dispatch:
+  schedule:
+    # W niedzielę i poniedziałek zbieramy tylko filingi SEC do następnego maila.
+    - cron: '17 5 * * 0,1'
+
+concurrency:
+  group: market-report-private-state
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -30,9 +37,19 @@ jobs:
       - name: Restore private configuration and state
         run: |
           set -euo pipefail
-          for file in watchlists.json daily_snapshots.csv prediction_tracker.csv; do
+          files=(watchlists.json)
+          if [[ "$GITHUB_EVENT_NAME" != "schedule" ]]; then
+            files+=(daily_snapshots.csv prediction_tracker.csv)
+          fi
+          for file in "${files[@]}"; do
             test -f "state/$file" || { echo "::error::Missing state/$file"; exit 1; }
             cp "state/$file" "app/$file"
+          done
+          mkdir -p app/state
+          for file in sec_edgar.json earnings_consensus.json; do
+            if [[ -f "state/$file" ]]; then
+              cp "state/$file" "app/state/$file"
+            fi
           done
 
       - name: Set up Python
@@ -49,6 +66,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run Market Report Engine
+        if: github.event_name == 'workflow_dispatch'
         working-directory: app
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -60,13 +78,30 @@ jobs:
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          SEC_CONTACT_EMAIL: ${{ secrets.SEC_CONTACT_EMAIL || vars.SEC_CONTACT_EMAIL }}
+          SEC_TICKERS: ${{ vars.SEC_TICKERS }}
         run: python main.py
+
+      - name: Poll SEC without generating or sending a report
+        if: github.event_name == 'schedule'
+        working-directory: app
+        env:
+          SEC_CONTACT_EMAIL: ${{ secrets.SEC_CONTACT_EMAIL || vars.SEC_CONTACT_EMAIL }}
+          SEC_TICKERS: ${{ vars.SEC_TICKERS }}
+        run: python main.py --sec-poll-only
 
       - name: Copy updated state
         if: success()
         run: |
-          cp app/daily_snapshots.csv state/daily_snapshots.csv
-          cp app/prediction_tracker.csv state/prediction_tracker.csv
+          if [[ "$GITHUB_EVENT_NAME" != "schedule" ]]; then
+            cp app/daily_snapshots.csv state/daily_snapshots.csv
+            cp app/prediction_tracker.csv state/prediction_tracker.csv
+          fi
+          for file in sec_edgar.json earnings_consensus.json; do
+            if [[ -f "app/state/$file" ]]; then
+              cp "app/state/$file" "state/$file"
+            fi
+          done
 
       - name: Commit updated private state
         if: success()
@@ -74,7 +109,14 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add daily_snapshots.csv prediction_tracker.csv
+          if [[ "$GITHUB_EVENT_NAME" != "schedule" ]]; then
+            git add daily_snapshots.csv prediction_tracker.csv
+          fi
+          for file in sec_edgar.json earnings_consensus.json; do
+            if [[ -f "$file" ]]; then
+              git add "$file"
+            fi
+          done
           if git diff --cached --quiet; then
             echo "No state changes to commit."
           else

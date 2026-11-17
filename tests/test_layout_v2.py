@@ -163,6 +163,28 @@ def test_earnings_are_used_only_in_saturday_forecast(sample_data, monkeypatch, s
         assert section == forecasts
 
 
+def test_monitoring_uses_only_current_company_filings_and_reported_figures(sample_data):
+    day = sample_data["now"].date()
+    source = "https://www.sec.gov/Archives/edgar/data/723125/"
+    filing = Filing("MU", "0000723125", "0000723125-26-000001", "8-K", day.isoformat(),
+                    day.isoformat(), "", ("2.02",), "results.htm", source, "Quarterly results")
+    entry = Earnings("MU", Period("quarter", day), filings=[filing])
+    entry.measures[("revenue", "GAAP")] = Measure(
+        "revenue", "GAAP", "USD", Decimal("2500000000"), source,
+    )
+    sample_data.update(earnings=[entry], monitoring_filings=[])
+    assert "2,5 mld USD" not in layout_v2._company_data_block(sample_data)
+    assert "ROE" not in layout_v2._company_data_block(sample_data)
+    assert "szacunki analityków" in layout_v2._basic_monitoring(sample_data)
+
+    sample_data["monitoring_filings"] = [filing]
+    for section in (layout_v2._company_data_block(sample_data), layout_v2._basic_monitoring(sample_data)):
+        assert "SEC EDGAR" in section
+        assert "Wyniki i sytuacja finansowa" in section
+        assert "Quarterly results" in section
+        assert "2,5 mld USD" in section
+
+
 def test_macro_section_emoji_and_today_prefix(sample_data):
     md = layout_v2.build_macro_md(sample_data)
     assert md.startswith("## 3. Makroekonomia")

@@ -29,7 +29,7 @@ from typing import Optional
 from gemini_client import call_gemini
 from earnings_report import format_earnings_context
 from market_sentiment import render_market_sentiment
-from sec_edgar import render_sec
+from sec_edgar import format_filing_event, render_sec
 from data_fetching import (
     TICKER_NAMES, TICKER_NOTES,
     get_index_tickers_v2, fetch_period_change, fetch_analyst_recommendations,
@@ -329,18 +329,20 @@ def _monitoring_breakouts(data: dict, quote: dict, technicals: dict) -> list[str
     ]
 
 
-def _monitoring_fundamentals(fund: dict) -> str:
-    """Kontekst biznesu z pobranych danych Yahoo Finance."""
-    observed = []
-    for label, value in (
-        ("marża operacyjna", _fmt_ratio(fund.get("operating_margin"), as_pct=True)),
-        ("ROE", _fmt_ratio(fund.get("return_on_equity"), as_pct=True)),
-        ("FCF Yield", _v(fund.get("fcf_yield_pct"), "%")),
-        ("dług/EBITDA", _fmt_ratio(fund.get("debt_to_ebitda"))),
-    ):
-        if value != "b/d":
-            observed.append(f"{label} {value}")
-    return "Fundamenty (Yahoo Finance) · " + ", ".join(observed) if observed else ""
+def _monitoring_sec(data: dict, ticker: str) -> tuple[list[str], str]:
+    filings = [filing for filing in data.get("monitoring_filings", []) if filing.ticker == ticker]
+    recent = {filing.accession for filing in filings}
+    earnings = [
+        entry for entry in data.get("earnings", [])
+        if entry.ticker == ticker and any(filing.accession in recent for filing in entry.filings)
+        and (entry.measures or entry.guidance)
+    ]
+    result_accessions = {filing.accession for entry in earnings for filing in entry.filings}
+    events = [
+        format_filing_event(filing, financial_results=filing.accession in result_accessions)
+        for filing in filings
+    ]
+    return events, format_earnings_context(earnings, [ticker])
 
 
 def _monitoring_earnings(info: dict) -> str:
@@ -368,9 +370,10 @@ def _company_data_block(data: dict) -> str:
             change = tech.get("change_5d") if not q.get("is_stale") else None
             out.append(f"      zmiana 5 sesji: {_v(change, '%')}")
         out.append(f"      wolumen ostatniej sesji vs średnia 10 sesji: {_v(tech.get('volume_ratio_10d'), 'x')}")
-        fundamentals = _monitoring_fundamentals(fund)
-        if fundamentals:
-            out.append(f"      {fundamentals}")
+        filings, results = _monitoring_sec(data, t)
+        out.extend(f"      SEC EDGAR (nowe): {filing}" for filing in filings)
+        if results:
+            out.append(f"      świeżo opublikowane wyniki, tylko do sekcji 4: {results}")
         earnings = _monitoring_earnings((data.get("earnings_dates") or {}).get(t) or {})
         if earnings:
             out.append(f"      {earnings}")
@@ -653,16 +656,26 @@ def _build_prompt_v2(data: dict) -> str:
     Nie oceniaj OFR ani CFTC wyłącznie na podstawie znaku liczby. Nie używaj HTML.
 
     ## 4. Monitoring spółek
-    Dla KAŻDEJ aktywnej spółki ({portfolio_label}) zwięzły blok narracyjny:
+    Dla KAŻDEJ aktywnej spółki ({portfolio_label}) przygotuj zwykle 10–14 zdań w 2–3 krótkich
+    akapitach. Jeśli jest mało nowych informacji, skróć blok zamiast wypełniać go starymi danymi.
+    Połącz wydarzenia biznesowe, sentyment i reakcję kursu w jedno podsumowanie, bez rozdziałów
+    typu „Analiza fundamentalna” i bez codziennego katalogu wskaźników.
     - nagłówek: **Nazwa (TICKER) [zmiana%, Cena: X USD/PLN]:**
     - zacznij od najistotniejszej zmiany w biznesie lub otoczeniu spółki. Wyjaśnij jej możliwy
       wpływ na popyt, przychody, marże, przepływy pieniężne lub ryzyko, o ile wynika z danych.
-      Podaj wybrane fundamenty (np. marżę operacyjną lub zadłużenie), jeśli pomagają w ocenie.
+      ROE, FCF, EBITDA, marże i inne liczby ze sprawozdania przytaczaj tylko wtedy, gdy jest pole
+      „świeżo opublikowane wyniki”. Wybierz najwyżej kilka liczb, które tłumaczą zmianę,
+      i porównaj z konsensusem, jeśli dostarczono porównywalny szacunek. W pozostałych
+      wydaniach omawiaj znaczenie nowych zdarzeń biznesowych bez recytowania stałych wskaźników.
       Istotny news podlinkuj jako [Tytuł newsa](URL) i oceń: *wpływ na tezę: wzmacnia /
       osłabia / neutralny*. Odróżniaj potwierdzone fakty, plany i oczekiwania;
+    - gdy jest pole „SEC EDGAR (nowe)”, podaj co spółka zgłosiła, jaki formularz złożyła i kiedy.
+      Dodaj link do EDGAR. Gdy metadane podają wyłącznie typ formularza, nie przypisuj mu
+      konkretnego zdarzenia. Form 144 oznacza zamiar sprzedaży, a Form 4 zmianę stanu posiadania.
     - oceń sentyment wokół tej spółki na podstawie konkretnych sygnałów: tonu wiadomości,
       zmiany rekomendacji, szacunków analityków, transakcji insiderów i short floatu.
-      Cele cenowe i Fwd P/E opisz jako oparte na oczekiwaniach. Wskaż niepewność przy sprzecznych
+      Uwzględnij zakupy insiderów i konsensus rekomendacji lub cen docelowych, jeśli są dostępne.
+      Cele cenowe opisz jako oczekiwania analityków. Wskaż niepewność przy sprzecznych
       sygnałach lub brakujących danych. Datę nadchodzących wyników opisz jako szacowaną,
       jeśli tak oznaczono ją w danych;
     - technikę ogranicz do jednego istotnego sygnału, jeśli dla spółki istnieje pole
@@ -700,7 +713,8 @@ def _build_prompt_v2(data: dict) -> str:
     co może być katalizatorem, na co konkretnie zwrócić uwagę (poziom ceny, wskaźnik, data).
     {saturday_sections}
     ZASADY (bezwzględnie przestrzegaj):
-    - Opublikowanych sprawozdań nie streszczaj w raporcie. Daty nadchodzących wyników możesz podawać.
+    - Świeżo opublikowane wyniki możesz przytoczyć wyłącznie w Monitoringu spółek.
+      Daty nadchodzących wyników możesz podawać także w pozostałych sekcjach.
     - NIE wymyślaj newsów, wydarzeń ani danych spoza dostarczonych poniżej.
     - Brak katalizatora ruchu -> napisz wprost: "brak jednoznacznego katalizatora w dostępnych informacjach".
     - Uzasadniaj wnioski konkretnymi liczbami, jeśli są dostępne i istotne dla danej sekcji.
@@ -728,7 +742,7 @@ def _build_prompt_v2(data: dict) -> str:
     SPÓŁKI PORTFELA (notowania, wolumen, rekomendacje, insiderzy, zmiany od poprzedniego raportu, newsy):
 {_company_data_block(data)}
 
-    PEŁNA TECHNIKA I FUNDAMENTY PORTFELA:
+    TECHNIKA I KONTEKST PORTFELA (wskaźniki techniczne do prognoz, nie do streszczenia w sekcji 4):
 {_fmt_portfolio_block(data["portfolio_details"])}
 
     NEWSY MAKRO I INDEKSOWE (spoza portfela — do sekcji 5):
@@ -1149,9 +1163,10 @@ def _basic_monitoring(data: dict) -> str:
                 lines.append(f"- [{a.get('publisher')}] [{a.get('title')}]({a['url']})")
             else:
                 lines.append(f"- [{a.get('publisher')}] {a.get('title')}")
-        fundamentals = _monitoring_fundamentals(fund)
-        if fundamentals:
-            lines.append(f"- {fundamentals}")
+        filings, results = _monitoring_sec(data, t)
+        lines.extend(f"- **SEC EDGAR** · {filing}" for filing in filings)
+        if results:
+            lines.extend(["", "**Świeżo opublikowane wyniki**", "", results, ""])
         recs = (data.get("v2", {}).get("analyst_recs") or {}).get(t, {})
         for rl in _fmt_analyst_recs(t, recs, price):
             if "brak danych analitycznych" not in rl:

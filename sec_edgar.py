@@ -199,6 +199,7 @@ class Filing:
     items: tuple[str, ...]
     primary_document: str
     url: str
+    description: str = ""
 
 
 def _filing_order(filing: Filing) -> tuple[str, str, str]:
@@ -259,7 +260,8 @@ def _valid_ticker(value: str) -> bool:
 
 def _state_filing(accession: str, raw: dict) -> Filing:
     filing = Filing(**{**raw, "items": tuple(raw["items"])})
-    for value in (filing.form, filing.report_date, filing.accepted_at, filing.primary_document, *filing.items):
+    for value in (filing.form, filing.report_date, filing.accepted_at, filing.primary_document,
+                  filing.description, *filing.items):
         if not isinstance(value, str):
             raise ValueError
     if (
@@ -417,6 +419,7 @@ def _rows(data: dict, ticker: str, cik: str, start: date, end: date) -> tuple[li
         filings.append(Filing(
             ticker, cik, accession, form, filed.isoformat(), report_date, accepted_at, items,
             _column_text(data, "primaryDocument", i), _filing_url(cik, accession),
+            _column_text(data, "primaryDocDescription", i)[:240],
         ))
     return filings, complete
 
@@ -628,6 +631,19 @@ def _topics(filing: Filing) -> list[str]:
         if "7.01" in filing.items:
             return ["Komunikaty w trybie Regulation FD"]
     return [_FORM_TOPICS.get(form, f"Inne zgłoszenia ({form})")]
+
+
+def format_filing_event(filing: Filing, *, financial_results: bool = False) -> str:
+    """Describe only events supported by filing metadata or a verified earnings release."""
+    topics = (
+        ["Publikacja wyników finansowych"]
+        if financial_results and _base_form(filing) == "6-K"
+        else _topics(filing)
+    )
+    description = filing.description.strip()
+    if description and description.upper() not in {filing.form.upper(), f"FORM {filing.form.upper()}"}:
+        topics.append(description)
+    return f"{filing.filing_date} · {_representative_link(filing)} · {_markdown(', '.join(topics))}"
 
 
 def _filing_count(count: int) -> str:

@@ -468,7 +468,7 @@ def _calculate_accuracy_stats(rows: list[dict]) -> dict:
     return groups
 
 
-def load_accuracy_feedback(limit: int = 20) -> dict:
+def load_accuracy_feedback(limit: int = 20, *, lesson_tickers: set[str] | None = None) -> dict:
     """Buduje zwięzły, historyczny kontekst dla sobotniego prompta Gemini."""
     path = get_predictions_file_path()
     if not os.path.exists(path):
@@ -487,8 +487,9 @@ def load_accuracy_feedback(limit: int = 20) -> dict:
         if chunks:
             summary_parts.append(f"{dimension}: " + "; ".join(chunks))
 
+    lesson_rows = [row for row in evaluated if lesson_tickers is None or row.get("ticker") in lesson_tickers]
     reviewed = [
-        row for row in evaluated
+        row for row in lesson_rows
         if row.get("lesson") or row.get("outcome_explanation")
     ]
     reviewed.sort(key=lambda row: (row.get("date", ""), row.get("ticker", "")), reverse=True)
@@ -503,7 +504,7 @@ def load_accuracy_feedback(limit: int = 20) -> dict:
     # Do czasu zapełnienia pola lesson model nadal widzi surowe, rozliczone
     # wyniki i tezy, więc pętla działa także na starszym CSV.
     if not lessons:
-        legacy = sorted(evaluated, key=lambda row: row.get("date", ""), reverse=True)
+        legacy = sorted(lesson_rows, key=lambda row: row.get("date", ""), reverse=True)
         lessons = [
             f"{row.get('date', 'b/d')} {row.get('ticker', 'b/d')}: "
             f"kierunek={row.get('direction', 'b/d')}, ruch={row.get('realized_pct', 'b/d')}%, "

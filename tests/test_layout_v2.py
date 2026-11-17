@@ -311,6 +311,22 @@ def test_saturday_basic_report(sample_data, monkeypatch):
     assert "kierunek=" not in forecast
 
 
+def test_saturday_feedback_keeps_only_current_company_details(monkeypatch):
+    monkeypatch.setattr(layout_v2, "US_TICKERS", ["MU"])
+    monkeypatch.setattr(layout_v2, "GPW_TICKERS_MAP", {})
+    monkeypatch.setattr(layout_v2, "evaluate_previous_predictions", lambda dry_run: {
+        "new": [{"ticker": "MU"}, {"ticker": "AAOI"}], "total_evaluated": 2,
+    })
+    monkeypatch.setattr(layout_v2, "load_accuracy_feedback", lambda limit, lesson_tickers: {
+        "lessons": sorted(lesson_tickers),
+    })
+
+    evaluation, feedback = layout_v2._ensure_saturday_feedback({"persist": False})
+
+    assert evaluation == {"new": [{"ticker": "MU"}], "total_evaluated": 2}
+    assert feedback == {"lessons": ["MU"]}
+
+
 def test_saturday_prompt_contains_feedback_and_upcoming_events(sample_data):
     sample_data["is_saturday"] = True
     sample_data["prediction_evaluation"] = {

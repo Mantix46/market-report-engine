@@ -31,7 +31,7 @@ from earnings_report import format_earnings_context
 from market_sentiment import render_market_sentiment
 from sec_edgar import format_filing_event, render_sec
 from data_fetching import (
-    TICKER_NAMES, TICKER_NOTES,
+    GPW_TICKERS_MAP, TICKER_NAMES, TICKER_NOTES, US_TICKERS,
     get_index_tickers_v2, fetch_period_change, fetch_analyst_recommendations,
     fetch_quote_cached,
 )
@@ -94,10 +94,7 @@ def collect_v2_extras(data: dict) -> dict:
     }
     if data.get("is_saturday"):
         # Ocena musi trafić do prompta, zanim Gemini napisze nowe prognozy.
-        data["prediction_evaluation"] = evaluate_previous_predictions(
-            dry_run=not data.get("persist", True)
-        )
-        data["prediction_feedback"] = load_accuracy_feedback(limit=20)
+        _ensure_saturday_feedback(data)
     return data
 
 
@@ -580,12 +577,14 @@ def _prediction_context(data: dict, ticker: str) -> str:
 def _ensure_saturday_feedback(data: dict) -> tuple[dict, dict]:
     """Zapewnia jednorazowe rozliczenie także w testach renderera wywołanego wprost."""
     evaluation = data.get("prediction_evaluation")
+    portfolio = set(US_TICKERS) | set(GPW_TICKERS_MAP)
     if evaluation is None:
         evaluation = evaluate_previous_predictions(dry_run=not data.get("persist", True))
+        evaluation["new"] = [item for item in evaluation.get("new", []) if item.get("ticker") in portfolio]
         data["prediction_evaluation"] = evaluation
     feedback = data.get("prediction_feedback")
     if feedback is None:
-        feedback = load_accuracy_feedback(limit=20)
+        feedback = load_accuracy_feedback(limit=20, lesson_tickers=portfolio)
         data["prediction_feedback"] = feedback
     return evaluation, feedback
 

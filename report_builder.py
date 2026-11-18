@@ -415,18 +415,15 @@ def _fmt_portfolio_block(portfolio_details: dict) -> str:
     out = []
     for t, d in portfolio_details.items():
         d = d or {}
-        q = d.get("quote") or {}
         tech = d.get("technicals") or {}
         fund = d.get("fundamentals") or {}
 
         out.append(f"    {TICKER_NAMES.get(t, t)} ({t}):")
-        out.append(f"      notowanie: {_fmt_quote_line(t, q)}")
         out.append(
             f"      technika: RSI {_v(tech.get('rsi_14'))}, vs SMA20 {_v(tech.get('price_vs_sma20'), '%')}, "
             f"vs SMA50 {_v(tech.get('price_vs_sma50'), '%')}, MACD hist {_v(tech.get('macd_histogram'))} "
             f"({_v(tech.get('macd_trend'))}), Bollinger {_v(tech.get('bollinger_position'))} "
-            f"({_v(tech.get('bollinger_signal'))}), zmiana 5 sesji {_v(tech.get('change_5d'), '%')}, "
-            f"wolumen {_v(tech.get('volume_ratio_10d'), 'x śr. 10d')}"
+            f"({_v(tech.get('bollinger_signal'))})"
         )
         out.append(
             f"      trend: układ średnich {_v(tech.get('ema_stack'))}, ADX {_v(tech.get('adx'))} "
@@ -447,7 +444,6 @@ def _fmt_portfolio_block(portfolio_details: dict) -> str:
             f"kapitalizacja {mcap_txt}, {_v(fund.get('pct_from_52w_high'), '%')} od szczytu 52w, "
             f"{_v(fund.get('pct_from_52w_low'), '%')} od dołka 52w, short float {_v(short_pct, '%')}"
         )
-        out.extend(format_insider_lines(t, fund))
         bench = US_BENCHMARK if not t.endswith(".WA") else PL_BENCHMARK
         out.append(f"      alpha 1M vs benchmark sektorowy ({bench}): {_v(d.get('alpha_1m_vs_benchmark'), ' pp')}")
         out.append("")

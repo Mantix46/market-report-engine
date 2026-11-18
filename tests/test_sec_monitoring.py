@@ -39,6 +39,20 @@ def test_monitoring_uses_edgar_excerpts_and_deduplicates_form4(monkeypatch):
     trade, = trades["MU"]
     assert (trade["side"], trade["shares"], trade["plan"], trade["url"]) == ("sprzedaż", 100, True, filing.url)
 
+    amendment = replace(filing, form="4/A", accession="0000000123-26-000003", filing_date="2026-11-18")
+    _, trades = sec_monitoring.collect_sec_monitoring([], [filing, amendment])
+    assert [trade["form"] for trade in trades["MU"]] == ["4/A"]
+
+
+def test_8k_excerpt_starts_at_substantive_item(monkeypatch):
+    url = f"{ARCHIVES_URL}/123/000000012326000004/current.htm"
+    filing = Filing("MU", "123", "0000000123-26-000004", "8-K", "2026-11-18", "", "",
+                    ("2.02",), "current.htm", url)
+    document = html.fromstring("<html><body>" + "Cover " * 500 + "Item 2.02 Quarterly results</body></html>")
+    monkeypatch.setattr(sec_monitoring, "_filing_documents", Mock(return_value=[(url, document)]))
+    documents, _ = sec_monitoring.collect_sec_monitoring([filing], [])
+    assert documents[filing.accession] == [(url, "Item 2.02 Quarterly results")]
+
 
 def test_unavailable_sec_form4_keeps_report_renderable(monkeypatch):
     filing = Filing("MU", "123", "0000000123-26-000001", "4", "2026-11-17", "", "", (),

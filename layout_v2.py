@@ -768,7 +768,8 @@ def _build_prompt_v2(data: dict) -> str:
     Zinterpretuj także poziom i zmianę OFR (stres finansowy) oraz CFTC (pozycja netto funduszy
     lewarowanych w kontraktach na S&P 500). Uwzględnij datę obserwacji, opóźnienia i możliwy hedging.
     Pomiń brakujące odczyty w ocenie kierunku.
-    Werdykt: czy news flow jest pozytywny/negatywny/mieszany i czy sentyment się zmienia.
+    Użyj najwyżej dwóch zdań. Wyjaśnij najważniejszą zmianę lub rozbieżność między sygnałami.
+    Tabela pod komentarzem zawiera daty i poziomy OFR oraz CFTC.
 
     {saturday_sections}
     ZASADY (bezwzględnie przestrzegaj):

@@ -226,10 +226,8 @@ def test_macro_news_block_excludes_portfolio(sample_data):
 def test_movers_section(sample_data):
     md = layout_v2.build_movers_md(sample_data)
     assert md.startswith("## 6. Radar rynkowy -- Największe ruchy dnia")
-    assert "### USA -- Top movers" in md
-    assert "### GPW -- Top movers" in md
-    assert "### Sektor AI Bottlenecks (Small/Mid-Caps) -- Top movers" in md
-    assert "| Spółka | Kurs | Zmiana |" in md
+    assert md.count("| **") == 4
+    assert "Wolumen vs poprzednie sesje" in md
     assert "$200.00" in md and "+5.00%" in md
     assert "150.00 PLN" in md
     assert "| 25.00 |" in md  # ticker EU bez znaku $
@@ -238,6 +236,10 @@ def test_movers_section(sample_data):
 def test_valuation_table(sample_data):
     md = layout_v2.build_valuation_md(sample_data)
     assert "## 8. Wycena i technika" in md
+    assert "| **MU** | 12.50 | 8.10 | 4.6% |" in md
+    assert "Trailing P/E" not in md
+    sample_data["is_saturday"] = True
+    md = layout_v2.build_valuation_md(sample_data)
     assert "| **MU** | 12.50 | b/d | 8.10 | 1.20 | 3.30 | 4.6% | 23.0% | 0.80 | 31.0% |" in md
     assert "RSI 55.0 · vs SMA50 +2.0% · MACD wzrostowy" in md
     # spółka bez fundamentów -> b/d wszędzie, bez wyjątku
@@ -257,9 +259,9 @@ def test_parse_ai_sections_missing_header_raises():
         layout_v2._parse_ai_sections(text)
 
 
-def test_basic_report_has_all_ten_sections(sample_data):
+def test_basic_report_has_all_nine_sections(sample_data):
     md = layout_v2.render_basic_report_v2(sample_data)
-    for i in range(1, 11):
+    for i in range(1, 10):
         assert f"## {i}." in md, f"Brak sekcji {i} w raporcie regułowym"
     assert md.startswith("# RAPORT RYNKOWY -- ")
     assert "Disclaimer" in md

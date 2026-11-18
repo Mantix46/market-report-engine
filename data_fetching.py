@@ -62,7 +62,6 @@ GPW_100_TICKERS = [
     'MLS.WA', 'PCR.WA', 'PNT.WA', 'PHN.WA', 'PXM.WA', 'VOT.WA', 'WLT.WA', 'ZUE.WA', 'SNK.WA', 'SGN.WA'
 ]
 
-RADAR_US = ["NVDA", "AMZN", "INTC", "CSCO", "ANET", "AMD", "TSLA", "META", "GOOG", "MSFT"]
 RADAR_GPW = GPW_100_TICKERS
 
 RADAR_SMALLCAPS = ["SOFI", "PLTR", "IONQ"]
@@ -181,10 +180,11 @@ def fetch_quote(ticker: str, period: str = "5d") -> dict:
             prev_close = hist["Close"].iloc[-2]
             change_pct = ((latest_close - prev_close) / prev_close) * 100
         else:
-            change_pct = 0.0
+            change_pct = None
             prev_close = None
         
         volume = hist["Volume"].iloc[-1] if "Volume" in hist.columns else 0
+        average_volume = hist["Volume"].iloc[:-1].mean() if len(hist) >= 2 and "Volume" in hist else 0
         
         latest_date = hist.index[-1].date()
         today = warsaw_today()
@@ -194,7 +194,8 @@ def fetch_quote(ticker: str, period: str = "5d") -> dict:
         return {
             "symbol": ticker,
             "price": round(latest_close, 2),
-            "change_pct": round(change_pct, 2),
+            "change_pct": round(change_pct, 2) if change_pct is not None else None,
+            "volume_ratio": float(volume / average_volume) if average_volume > 0 else None,
             "prev_close": round(prev_close, 2) if prev_close is not None else None,
             "volume": int(volume),
             "error": False,
@@ -230,6 +231,9 @@ class TickerCache:
         
         self._cache[key] = result  # cache even if error
         return result
+
+    def clear(self):
+        self._cache.clear()
     
     def fetch_batch(self, tickers: list[str], period: str = "5d") -> dict:
         """Pobiera dane dla listy tickerów (wykorzystuje ThreadPoolExecutor oraz cache)."""
@@ -323,12 +327,13 @@ def fetch_period_change(ticker: str, period: str = "7d") -> Optional[float]:
 def get_top_movers(tickers: list[str], top_n: int = 3, period: str = "5d") -> tuple[list, list]:
     """Zwraca top N zyskujących i tracących."""
     quotes = fetch_quotes_batch(tickers, period)
-    valid = [(k, v) for k, v in quotes.items() if not v.get("error")]
+    valid = [(k, v) for k, v in quotes.items() if not v.get("error") and not v.get("is_stale")
+             and v.get("change_pct") is not None and (v.get("volume_ratio") or 0) >= 0.7]
     
     sorted_by_change = sorted(valid, key=lambda x: x[1].get("change_pct", 0))
     
-    losers = sorted_by_change[:top_n]
-    winners = sorted_by_change[-top_n:][::-1]
+    losers = [(ticker, quote) for ticker, quote in sorted_by_change if quote["change_pct"] < 0][:top_n]
+    winners = [(ticker, quote) for ticker, quote in reversed(sorted_by_change) if quote["change_pct"] > 0][:top_n]
     
     return winners, losers
 
@@ -508,7 +513,7 @@ def _parse_value_from_text(text: str, shares: int) -> Optional[float]:
     return shares * ((low + high) / 2.0)
 
 
-def _parse_row_value(row, shares: int, transaction: str, last_price) -> Optional[float]:
+def _parse_row_value(row, shares: int, transaction: str) -> Optional[float]:
     raw = row.get("Value")
     try:
         value = float(raw) if raw is not None and not pd.isna(raw) else None
@@ -522,8 +527,6 @@ def _parse_row_value(row, shares: int, transaction: str, last_price) -> Optional
     text_value = _parse_value_from_text(transaction, shares)
     if text_value:
         return text_value
-    if shares and last_price:
-        return float(shares) * float(last_price)
     return None
 
 
@@ -567,13 +570,14 @@ def parse_form4_plan_flag(filing_text: str) -> Optional[bool]:
 
 
 def fetch_fmp_insider_trades(ticker: str, cutoff) -> list[dict]:
-    if not FMP_API_KEY or ticker.endswith(".WA"):
+    key = os.getenv("FMP_API_KEY") or os.getenv("FINANCIAL_MODELING_PREP_API_KEY") or FMP_API_KEY
+    if not key or ticker.endswith(".WA"):
         return []
     symbol = ticker.replace(".WA", "")
     try:
         response = requests.get(
             "https://financialmodelingprep.com/stable/insider-trading/search",
-            params={"symbol": symbol, "page": 0, "limit": 100, "apikey": FMP_API_KEY},
+            params={"symbol": symbol, "page": 0, "limit": 100, "apikey": key},
             timeout=12,
         )
         if response.status_code in (401, 402, 403):
@@ -705,6 +709,7 @@ def fetch_fundamentals_short_insider(ticker: str) -> dict:
         recent_sales_90d = 0
         recent_other_90d = 0
         recent_total_90d = 0
+        unknown_value_90d = 0
         planned_buy_value_90d = 0.0
         planned_sell_value_90d = 0.0
         discretionary_buy_value_90d = 0.0
@@ -724,7 +729,7 @@ def fetch_fundamentals_short_insider(ticker: str) -> dict:
             if insider_df is None or insider_df.empty:
                 # Yahoo nie zwraca tabel insiderów dla tickerów GPW. To nie jest
                 # równoznaczne z zerową aktywnością i nie może być tak pokazane.
-                insider_data_status = "unavailable" if ticker.endswith(".WA") else "no_open_market_trades"
+                insider_data_status = "unavailable"
             else:
                 fmp_trades = fetch_fmp_insider_trades(ticker, cutoff)
                 plan_flags = fetch_form4_plan_map(fmp_trades) if fmp_trades else {}
@@ -742,7 +747,7 @@ def fetch_fundamentals_short_insider(ticker: str) -> dict:
                     except Exception:
                         shares = 0
 
-                    value = _parse_row_value(row, shares, transaction, price)
+                    value = _parse_row_value(row, shares, transaction)
                     raw_date = row.get("Start Date", "")
                     parsed_date = pd.to_datetime(raw_date, errors="coerce")
                     is_recent = bool(not pd.isna(parsed_date) and parsed_date.date() >= cutoff)
@@ -750,6 +755,8 @@ def fetch_fundamentals_short_insider(ticker: str) -> dict:
                         continue
 
                     side = _transaction_side(transaction)
+                    if value is None and side in ("buy", "sell"):
+                        unknown_value_90d += 1
                     plan = classify_plan_for_row(
                         raw_date, _cell_str(row.get("Insider")), shares, side,
                         fmp_trades, plan_flags,
@@ -840,6 +847,7 @@ def fetch_fundamentals_short_insider(ticker: str) -> dict:
             "short_ratio": info.get("shortRatio"),
             "insider_transactions": insiders[:5],
             "insider_summary": {
+                "unknown_value_90d": unknown_value_90d,
                 "buy_shares_90d": buy_shares_90d,
                 "sell_shares_90d": sell_shares_90d,
                 "buy_value_90d": round(buy_value_90d, 0),
@@ -956,7 +964,7 @@ def fetch_macro_calendar(days_ahead: int = 10, countries: Optional[list[str]] = 
                     "source": "fred",
                 })
         except Exception as e:
-            logger.warning(f"Blad pobierania kalendarza makro z FRED: {e}")
+            logger.warning("Błąd pobierania kalendarza FRED (%s).", type(e).__name__)
     elif not fred_key:
         logger.info("Brak FRED_API_KEY — kalendarz makro bez publikacji US z FRED.")
 
@@ -964,6 +972,8 @@ def fetch_macro_calendar(days_ahead: int = 10, countries: Optional[list[str]] = 
     for country, (name, dates) in MACRO_MEETINGS.items():
         if country not in countries:
             continue
+        if str(date_to)[:4] > max(dates)[:4]:
+            logger.warning("Kalendarz %s obejmuje dane do %s.", name, max(dates))
         for d in dates:
             if str(date_from) <= d <= str(date_to):
                 events.append({
@@ -990,20 +1000,20 @@ def fetch_macro_calendar(days_ahead: int = 10, countries: Optional[list[str]] = 
 
 def fetch_earnings_call_context(tickers: list[str], max_items: int = 2) -> dict:
     """Fetch earnings-call transcript context when possible, otherwise use guidance-related news."""
-    global FMP_API_KEY
+    transcript_key = os.getenv("FMP_API_KEY") or os.getenv("FINANCIAL_MODELING_PREP_API_KEY") or FMP_API_KEY
     results = {}
     for ticker in tickers:
         items = []
 
-        if FMP_API_KEY:
+        if transcript_key:
             try:
                 symbol = ticker.replace(".WA", "")
                 transcript_url = f"https://financialmodelingprep.com/api/v3/earning_call_transcript/{symbol}"
-                params = {"limit": max_items, "apikey": FMP_API_KEY}
+                params = {"limit": max_items, "apikey": transcript_key}
                 r = requests.get(transcript_url, params=params, timeout=12)
                 if r.status_code in (401, 402, 403):
-                    logger.info(f"Wyłączam FMP API dla transkryptów (status {r.status_code}: {r.text[:120]})")
-                    FMP_API_KEY = None
+                    logger.info("FMP transkrypty niedostępne (HTTP %s).", r.status_code)
+                    transcript_key = None
                 elif r.ok:
                     for item in (r.json() or [])[:max_items]:
                         content = item.get("content") or ""
@@ -1015,8 +1025,7 @@ def fetch_earnings_call_context(tickers: list[str], max_items: int = 2) -> dict:
                             "source": "financialmodelingprep_transcript",
                         })
             except Exception as e:
-                if FMP_API_KEY:
-                    logger.warning(f"Blad pobierania transkryptu earnings dla {ticker}: {e}")
+                logger.warning("Błąd pobierania transkryptu %s (%s).", ticker, type(e).__name__)
 
         if not items:
             try:

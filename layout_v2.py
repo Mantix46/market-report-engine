@@ -1,4 +1,4 @@
-"""Layout v2 raportu rynkowego — alternatywny, 10-sekcyjny układ (flaga --layout v2).
+"""Aktywny układ raportu rynkowego z dziewięcioma sekcjami.
 
 Konsumuje ten sam słownik ReportData z report_builder.collect_report_data();
 sekcje deterministyczne (2, 3, 5, 6, 8) buduje w Pythonie, sekcje narracyjne
@@ -14,7 +14,6 @@ Struktura (celowo INNA niż v1 — patrz skill report-style, sekcja "Layout v2")
  7. Ryzyka                     (AI)
  8. Wycena i technika          (tabela wskaźników wyceny + sygnał techniczny)
  9. Sentyment                  (AI, proxy: VIX/short/insider/wolumen/rekomendacje)
-10. Watchlist                  (AI)
 
 v2 prowadzi sobotni tracker prognoz: rozlicza poprzedni horyzont przed promptem
 Gemini i zapisuje zarówno benchmark techniczny, jak i prognozę wieloczynnikową AI.
@@ -40,7 +39,7 @@ from report_builder import (
     _v, _fmt_quote_line, _fmt_quotes_block, _fmt_movers, _fmt_portfolio_block,
     generate_trend_analysis_section,
 )
-from technicals import generate_technical_signal, generate_alerts, trend_label
+from technicals import generate_technical_signal, trend_label
 from snapshot_store import calculate_deltas
 from accuracy_tracker import (
     build_rule_based_predictions, evaluate_previous_predictions,
@@ -60,7 +59,6 @@ V2_AI_HEADERS = [
     "## 5. Top 5 wydarzeń makro",
     "## 7. Ryzyka",
     "## 9. Sentyment",
-    "## 10. Watchlist",
 ]
 
 # Sobotnia sekcja AI — format bulletów MUSI pasować do regexa
@@ -163,7 +161,7 @@ def build_macro_md(data: dict) -> str:
         if q.get("error") or q.get("price") is None:
             lines.append(f"| {name} | b/d | b/d |")
         else:
-            lines.append(f"| {name} | {q['price']:.2f} | {format_change(q['change_pct'])} |")
+            lines.append(f"| {name} | {q['price']:.2f} | {format_pct(q.get('change_pct'))} |")
     lines.append("")
     lines.append("**Kalendarz makro (najbliższe dni):**")
     today = data["now"].date()
@@ -177,22 +175,45 @@ def build_macro_md(data: dict) -> str:
 
 def _movers_table(movers: list, is_us: bool = True) -> list[str]:
     """Tabela top movers w formacie zgodnym z v1 (render_basic_report)."""
-    lines = ["| Spółka | Kurs | Zmiana |", "|--------|------|--------|"]
+    lines = ["| Spółka | Kurs | Zmiana | Wolumen vs poprzednie sesje |",
+             "|--------|------|--------|-----------------------------|"]
     for ticker, q in movers:
         name_disp = TICKER_NAMES.get(ticker, ticker)
-        if is_us:
+        if is_us and not ticker.endswith(".WA"):
             is_eu = any(suf in ticker for suf in (".DE", ".PA", ".L"))
             price_disp = f"{q['price']:.2f}" if is_eu else f"${q['price']:.2f}"
         else:
             price_disp = f"{q['price']:.2f} PLN"
-        lines.append(f"| **{name_disp}** ({ticker}) | {price_disp} | {format_change(q['change_pct'])} |")
+        ratio = q.get("volume_ratio")
+        volume = f"{ratio:.2f}×" if ratio is not None else "b/d"
+        lines.append(f"| **{name_disp}** ({ticker}) | {price_disp} | {format_change(q['change_pct'])} | {volume} |")
     return lines
+
+
+def _radar_rows(data: dict) -> list:
+    portfolio = set(US_TICKERS) | set(GPW_TICKERS_MAP) | set(data["active_tickers"])
+    candidates = {
+        ticker: quote for rows in data["today_movers"].values() for ticker, quote in rows
+        if ticker not in portfolio and quote.get("change_pct") is not None
+    }
+    return sorted(candidates.items(), key=lambda item: abs(item[1]["change_pct"]), reverse=True)[:4]
 
 
 def build_movers_md(data: dict) -> str:
     """## 6. Radar rynkowy — układ z v1: podsekcje USA/GPW/AI Bottlenecks z tabelami."""
     movers = data["today_movers"]
     lines = ["## 6. Radar rynkowy -- Największe ruchy dnia", ""]
+    if not data.get("is_saturday"):
+        rows = _radar_rows(data)
+        lines.extend(_movers_table(rows) if rows else ["Brak ruchów spełniających kryteria radaru."])
+        for ticker, _ in rows:
+            articles = (data.get("news_data") or {}).get(ticker, [])
+            if article := next((item for item in articles if item.get("title") and item.get("url")), None):
+                title = article["title"].replace("[", "").replace("]", "")
+                lines.append(f"\n- **{ticker}** · [Wiadomość związana ze spółką: {title}]({article['url']})")
+            else:
+                lines.append(f"\n- **{ticker}** · Przyczyna ruchu niepotwierdzona.")
+        return "\n".join(lines) + "\n"
 
     if data["us_active"] and (movers["us_winners"] or movers["us_losers"]):
         lines.append("### USA -- Top movers")
@@ -227,8 +248,9 @@ def build_valuation_md(data: dict) -> str:
     lines.append(
         "| Spółka | Fwd P/E | Trailing P/E | EV/EBITDA | PEG | P/B "
         "| FCF Yield | ROE | Debt/EBITDA | Marża oper. | Technika |"
+        if data.get("is_saturday") else "| Spółka | Fwd P/E | EV/EBITDA | FCF Yield | Technika |"
     )
-    lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
+    lines.append("|" + " :--- |" * (11 if data.get("is_saturday") else 5))
     band_labels = {
         "above_upper_band": "nad górną", "near_upper_band": "przy górnej",
         "below_lower_band": "pod dolną", "near_lower_band": "przy dolnej",
@@ -252,6 +274,8 @@ def build_valuation_md(data: dict) -> str:
         macd = {
             "bullish": "wzrostowy", "positive": "dodatni",
             "bearish": "spadkowy", "negative": "ujemny",
+            "improving": "poprawa", "weakening": "osłabienie",
+            "bullish_cross": "przecięcie wzrostowe", "bearish_cross": "przecięcie spadkowe",
         }.get(tech.get("macd_trend"))
         bands = band_labels.get(tech.get("bollinger_signal"))
         indicators = [
@@ -265,6 +289,10 @@ def build_valuation_md(data: dict) -> str:
             technical_summary += f"<br>{detail}"
         else:
             technical_summary = "b/d (brak historii lub wskaźników)"
+        if not data.get("is_saturday"):
+            lines.append(f"| **{ticker}** | {_fmt_ratio(fund.get('forward_pe'))} "
+                         f"| {_fmt_ratio(fund.get('ev_to_ebitda'))} | {fcf_str} | {technical_summary} |")
+            continue
         lines.append(
             f"| **{ticker}** | {_fmt_ratio(fund.get('forward_pe'))} "
             f"| {_fmt_ratio(fund.get('trailing_pe'))} "
@@ -279,8 +307,7 @@ def build_valuation_md(data: dict) -> str:
         )
     lines.append("")
     lines.append(
-        "> Interpretacja: wartości porównuj ze średnią sektorową (semis: EV/EBITDA ~15-25, "
-        "GPW: P/E ~8-15). \"b/d\" = wskaźnik niedostępny w yfinance (częste dla GPW i spółek bez zysków)."
+        "> Ujemny mnożnik ma ograniczoną wartość porównawczą. b/d oznacza brak danych."
     )
     lines.append("")
     return "\n".join(lines)
@@ -290,7 +317,7 @@ def build_valuation_md(data: dict) -> str:
 # Bloki danych dla prompta AI i fallbacku regułowego
 # ============================================================
 
-def _fmt_analyst_recs(ticker: str, recs: dict, price: Optional[float]) -> list[str]:
+def _fmt_analyst_recs(ticker: str, recs: dict, price: Optional[float], previous: dict | None = None) -> list[str]:
     """Linie opisu rekomendacji analityków dla jednej spółki."""
     out = []
     summary = recs.get("rec_summary")
@@ -303,8 +330,12 @@ def _fmt_analyst_recs(ticker: str, recs: dict, price: Optional[float]) -> list[s
         upside = f" (potencjał {((mean / price) - 1) * 100:+.1f}%)" if price else ""
         out.append(
             f"      szacunki analityków: średnia cena docelowa {mean:.2f}{upside}, "
-            f"zakres {_v(targets.get('low'))}-{_v(targets.get('high'))}"
+            f"zakres {_v(targets.get('low'))}-{_v(targets.get('high'))} (Yahoo Finance)"
         )
+        prior = (previous or {}).get("target_mean")
+        if prior and round(mean - prior, 2):
+            out.append(f"      zmiana celu od odczytu {previous['date']}: {prior:.2f} → {mean:.2f} "
+                       f"({(mean / prior - 1) * 100:+.1f}%)")
     for ch in recs.get("recent_changes", []):
         out.append(
             f"      zmiana rekomendacji {ch.get('date')}: {ch.get('firm')} "
@@ -352,8 +383,11 @@ def _sec_insider_lines(data: dict, ticker: str) -> list[tuple[str, str]]:
     for trade in sorted(trades, key=lambda trade: trade["date"], reverse=True)[:3]:
         url = trade["url"]
         plan = " · zgłoszenie oznaczone 10b5-1" if trade["plan"] else ""
-        lines.append((url, f"{trade['date']} · {trade['owner']} · {trade['side']} {trade['shares']:,} akcji "
-                           f"po {trade['price']:.2f}{plan} · [Form 4]({url})"))
+        price = f" po {trade['price']:.2f}" if trade["price"] is not None else " · cena b/d"
+        filed = f" · zgłoszono {trade['filed']}" if trade.get("filed") else ""
+        form = trade.get("form", "4")
+        lines.append((url, f"{trade['date']} · {trade['owner']} · {trade['side']} {trade['shares']:,} akcji"
+                           f"{price}{plan}{filed} · [Form {form}]({url})"))
     return lines
 
 
@@ -394,7 +428,8 @@ def _company_data_block(data: dict) -> str:
         if earnings:
             out.append(f"      {earnings}")
 
-        out.extend(_fmt_analyst_recs(t, (v2.get("analyst_recs") or {}).get(t, {}), q.get("price")))
+        out.extend(_fmt_analyst_recs(t, (v2.get("analyst_recs") or {}).get(t, {}), q.get("price"),
+                                     (data.get("last_target_snapshots") or {}).get(t)))
 
         out.extend(format_insider_lines(t, fund))
         for _, trade in _sec_insider_lines(data, t):
@@ -457,7 +492,7 @@ def _sentiment_data_block(data: dict) -> str:
     vix = (data.get("macro_quotes") or {}).get("VIX") or {}
     if vix.get("price") is not None:
         out.append(
-            f"    VIX: {vix['price']:.2f} ({format_change(vix.get('change_pct', 0))}) — "
+            f"    VIX: {vix['price']:.2f} ({format_pct(vix.get('change_pct'))}) — "
             f"{'risk-on (<15)' if vix['price'] < 15 else 'risk-off (>25)' if vix['price'] > 25 else 'neutralny (15-25)'}"
         )
 
@@ -653,7 +688,7 @@ def _build_prompt_v2(data: dict) -> str:
     {_FORECAST_INSTRUCTIONS}
     """
 
-    n_sections = "osiem" if is_saturday else "sześć"
+    n_sections = "siedem" if is_saturday else "pięć"
     return f"""
     Jesteś starszym analitykiem rynków kapitałowych (NASDAQ i GPW). Piszesz po polsku,
     zwięźle, profesjonalnym językiem finansowym, bez marketingowego entuzjazmu.
@@ -663,7 +698,7 @@ def _build_prompt_v2(data: dict) -> str:
     bez głównego tytułu raportu):
 
     ## 1. Executive Summary
-    5-10 zwięzłych punktów do przeczytania w minutę: co wydarzyło się od poprzedniego raportu
+    1–3 zwięzłe punkty o najważniejszych zmianach od poprzedniego raportu
     (wykorzystaj pola "co się zmieniło od poprzedniego raportu" z danych spółek), które spółki
     wymagają dziś uwagi i dlaczego, najważniejsze informacje makro, czy zmienił się sentyment rynku.
     Każdy punkt zapisz w osobnym wierszu: - emoji **Krótka etykieta** · jedno lub dwa zdania.
@@ -714,7 +749,7 @@ def _build_prompt_v2(data: dict) -> str:
     - blok zakończ linią: **Wpływ: pozytywny / neutralny / negatywny** (jedna ocena łączna).
 
     ## 5. Top 5 wydarzeń makro
-    Wymieszaj dwa rodzaje pozycji w jednej liście (dokładnie 5 pozycji):
+    Podaj maksymalnie trzy istotne pozycje. Pomiń wydarzenia omówione w Executive Summary:
     (a) bieżące wydarzenia makro z sekcji NEWSY MAKRO I INDEKSOWE — opisz narracyjnie
     (1-2 zdania, dlaczego to ważne dla rynku) i wpleć link markdown [Tytuł newsa](URL);
     (b) nadchodzące publikacje i posiedzenia z sekcji KALENDARZ MAKRO (CPI, PPI, payrolls,
@@ -723,7 +758,7 @@ def _build_prompt_v2(data: dict) -> str:
     NIE wymyślaj wydarzeń spoza dostarczonych danych.
 
     ## 7. Ryzyka
-    Krótka lista (3-6 punktów) ryzyk popartych WYŁĄCZNIE dostarczonymi danymi: wydarzenia makro
+    Maksymalnie trzy ryzyka pominięte w poprzednich sekcjach, poparte dostarczonymi danymi: wydarzenia makro
     wysokiej wagi, posiedzenia banków centralnych, wysoki short interest, bliskie publikacje
     wyników, konkretne newsy o regulacjach/geopolityce/konkurencji. Każde ryzyko z wagą 🔴/🟠/🟢.
 
@@ -735,9 +770,6 @@ def _build_prompt_v2(data: dict) -> str:
     Pomiń brakujące odczyty w ocenie kierunku.
     Werdykt: czy news flow jest pozytywny/negatywny/mieszany i czy sentyment się zmienia.
 
-    ## 10. Watchlist
-    Spółki wymagające obserwacji DZIŚ (z portfela lub top movers). Dla każdej: dlaczego,
-    co może być katalizatorem, na co konkretnie zwrócić uwagę (poziom ceny, wskaźnik, data).
     {saturday_sections}
     ZASADY (bezwzględnie przestrzegaj):
     - Świeżo opublikowane wyniki możesz przytoczyć wyłącznie w Monitoringu spółek.
@@ -770,7 +802,7 @@ def _build_prompt_v2(data: dict) -> str:
 {_company_data_block(data)}
 
     TECHNIKA I KONTEKST PORTFELA (wskaźniki techniczne do prognoz, nie do streszczenia w sekcji 4):
-{_fmt_portfolio_block(data["portfolio_details"])}
+{_fmt_portfolio_block(data["portfolio_details"]) if is_saturday else ""}
 
     NEWSY MAKRO I INDEKSOWE (spoza portfela — do sekcji 5):
 {_macro_news_block(data)}
@@ -913,7 +945,7 @@ def _render_predictions(data: dict, predictions: list[dict], *, fallback: bool =
 
 
 def _assemble_report(data: dict, ai_sections: dict) -> str:
-    """Składa finalny raport v2: nagłówek + sekcje 1-10 w kolejności + disclaimer.
+    """Składa finalny raport v2: nagłówek + sekcje 1-9 w kolejności + disclaimer.
     W sobotę dodatkowo: analiza trendu, trafność prognoz i prognozy do weryfikacji."""
     filing_sections = []
     if "sec_scan" in data:
@@ -924,7 +956,7 @@ def _assemble_report(data: dict, ai_sections: dict) -> str:
             for filing in entry.filings
         }
         filing_sections.extend([
-            render_sec(data["sec_scan"], earnings_accessions=earnings_accessions), "", "---", "",
+            render_sec(data["sec_scan"], earnings_accessions=earnings_accessions, compact=True), "", "---", "",
         ])
     sentiment = (
         ["", render_market_sentiment(data["market_sentiment"])]
@@ -938,10 +970,31 @@ def _assemble_report(data: dict, ai_sections: dict) -> str:
     if unlinked_trades:
         monitoring = "\n\n".join([monitoring.rstrip(), "**Transakcje insiderów zgłoszone w SEC (7 dni)**",
                                  "\n".join(unlinked_trades)])
+    missing_targets = [
+        ticker for ticker, recs in (data.get("v2", {}).get("analyst_recs") or {}).items()
+        if not recs.get("price_targets")
+    ]
+    if missing_targets:
+        monitoring += "\n\nCele cenowe niedostępne w Yahoo Finance dla " + ", ".join(missing_targets) + "."
+    today = data["now"].date().isoformat()
+    upcoming = [
+        (event["date"], event["event"])
+        for event in data["macro_calendar"]
+        if (event.get("date") or "") >= today and event.get("impact") == "high"
+    ]
+    upcoming.extend(
+        (info["date"], f"{ticker} · wyniki (termin wg Yahoo Finance)")
+        for ticker, info in (data.get("earnings_dates") or {}).items() if (info.get("date") or "") >= today
+    )
+    catalyst = []
+    if upcoming:
+        date, label = min(upcoming)
+        catalyst = ["", f"**Najbliższy katalizator** · {date} · {label}"]
     parts = [
         _header_v2(data["now"], data["skip"], data["status"]).rstrip("\n"),
         "",
         re.sub(r"(?<=\S)\n(?=[-*] )", "\n\n", ai_sections["## 1. Executive Summary"]),
+        *catalyst,
         "",
         "---",
         "",
@@ -972,10 +1025,6 @@ def _assemble_report(data: dict, ai_sections: dict) -> str:
         "",
         ai_sections["## 9. Sentyment"],
         *sentiment,
-        "",
-        "---",
-        "",
-        ai_sections["## 10. Watchlist"],
         "",
         "---",
         "",
@@ -1158,9 +1207,7 @@ def _basic_executive_summary(data: dict) -> str:
         lines.append(line + ".")
 
     lines.append("")
-    lines.append("*Sekcja wygenerowana regułowo (fallback bez AI).*")
-    lines.append("")
-    return "\n".join(lines)
+    return "\n".join(lines[:5]) + "\n"
 
 
 def _basic_company_impact(q: dict, tech: dict) -> str:
@@ -1203,7 +1250,7 @@ def _basic_monitoring(data: dict) -> str:
         if results:
             lines.extend(["", "**Świeżo opublikowane wyniki**", "", results, ""])
         recs = (data.get("v2", {}).get("analyst_recs") or {}).get(t, {})
-        for rl in _fmt_analyst_recs(t, recs, price):
+        for rl in _fmt_analyst_recs(t, recs, price, (data.get("last_target_snapshots") or {}).get(t)):
             if "brak danych analitycznych" not in rl:
                 lines.append(f"- {rl.strip()}")
         if fund.get("insider_data_status") == "available":
@@ -1233,7 +1280,7 @@ def _basic_macro_top5(data: dict) -> str:
         [e for e in data["macro_calendar"] if e.get("date") or e.get("date_range")],
         key=lambda e: (0 if e.get("impact") == "high" else 1, e.get("date") or ""),
     )
-    for event in events[:5]:
+    for event in events[:3]:
         lines.append(_calendar_line(event, today))
     if len(lines) == 2:
         lines.append("- brak wydarzeń makro w danych")
@@ -1271,10 +1318,9 @@ def _basic_risks(data: dict) -> str:
 def _basic_sentiment(data: dict) -> str:
     """Regułowa sekcja 9: sygnały proxy + werdykt na bazie VIX."""
     lines = ["## 9. Sentyment", ""]
-    block = _sentiment_data_block(data)
-    lines.extend(line.strip() and f"- {line.strip()}" or "" for line in block.splitlines())
     vix = (data.get("macro_quotes") or {}).get("VIX") or {}
     if vix.get("price") is not None:
+        lines.append(f"**VIX {vix['price']:.2f}** · odczyt {vix.get('data_date') or 'b/d'}.")
         verdict = (
             "risk-on (niska zmienność implikowana)" if vix["price"] < 15
             else "risk-off (podwyższona zmienność)" if vix["price"] > 25
@@ -1282,31 +1328,8 @@ def _basic_sentiment(data: dict) -> str:
         )
         lines.append("")
         lines.append(f"**Werdykt (regułowy, wg VIX): {verdict}.**")
-    lines.append("")
-    lines.append("*Sekcja wygenerowana regułowo (fallback bez AI).*")
-    lines.append("")
-    return "\n".join(lines)
-
-
-def _basic_watchlist(data: dict) -> str:
-    """Regułowa sekcja 10: spółki z alertami technicznymi lub bliskimi wynikami."""
-    lines = ["## 10. Watchlist", ""]
-    entries = []
-    for t in data["active_tickers"]:
-        details = data["portfolio_details"].get(t, {}) or {}
-        details = dict(details)
-        details["earnings"] = (data.get("earnings_dates") or {}).get(t, {})
-        alerts = generate_alerts(t, details, (data.get("last_snapshots") or {}).get(t))
-        for alert in alerts:
-            entries.append(f"- **{t}**: {alert} — katalizator techniczny, obserwuj reakcję kursu.")
-        earnings = (data.get("earnings_dates") or {}).get(t, {})
-        days = earnings.get("days_until")
-        if days is not None and 0 <= days <= 7:
-            entries.append(
-                f"- **{t}**: wyniki {earnings.get('date')} (za {days} dni) — "
-                f"katalizator fundamentalny, zwróć uwagę na guidance."
-            )
-    lines.extend(entries or ["- Brak spółek wymagających szczególnej obserwacji według reguł."])
+    else:
+        lines.append("VIX niedostępny.")
     lines.append("")
     lines.append("*Sekcja wygenerowana regułowo (fallback bez AI).*")
     lines.append("")
@@ -1377,7 +1400,6 @@ def render_basic_report_v2(data: dict) -> str:
         "## 5. Top 5 wydarzeń makro": _basic_macro_top5(data).rstrip("\n"),
         "## 7. Ryzyka": _basic_risks(data).rstrip("\n"),
         "## 9. Sentyment": _basic_sentiment(data).rstrip("\n"),
-        "## 10. Watchlist": _basic_watchlist(data).rstrip("\n"),
     }
     if data.get("is_saturday"):
         review_md = _basic_prediction_reviews(data)

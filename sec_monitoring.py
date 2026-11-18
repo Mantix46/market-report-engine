@@ -2,6 +2,7 @@
 
 from decimal import Decimal, InvalidOperation
 import logging
+import re
 from urllib.parse import urlsplit
 
 from lxml import etree
@@ -13,6 +14,7 @@ logger = logging.getLogger(__name__)
 DOCUMENT_LIMIT = 8
 FORM4_LIMIT = 20
 EXCERPT_LENGTH = 2400
+ITEM_HEADING = re.compile(r"\bItem\s+\d+\.\d{2}\b", re.IGNORECASE)
 
 
 def _form4_document(filing):
@@ -38,27 +40,43 @@ def _form4_transactions(document, filing):
         date = row.findtext("transactionDate/value")
         try:
             shares = Decimal(row.findtext("transactionAmounts/transactionShares/value", ""))
-            price = Decimal(row.findtext("transactionAmounts/transactionPricePerShare/value", ""))
         except InvalidOperation:
             continue
-        if not date or not shares.is_finite() or not price.is_finite() or shares <= 0 or price < 0:
+        if not date or not shares.is_finite() or shares <= 0:
             continue
+        try:
+            price = Decimal(row.findtext("transactionAmounts/transactionPricePerShare/value", ""))
+            if not price.is_finite() or price <= 0:
+                price = None
+        except InvalidOperation:
+            price = None
         plan = document.findtext("aff10b5One", "").strip().lower() in {"1", "true"}
         trades.append({"owner": owners, "side": "kupno" if code == "P" else "sprzedaż",
-                       "date": date, "shares": shares, "price": price, "url": filing.url, "plan": plan})
+                       "date": date, "shares": shares, "price": price, "url": filing.url, "plan": plan,
+                       "filed": filing.filing_date, "form": filing.form})
     return trades
 
 
 def collect_sec_monitoring(recent_filings, weekly_filings):
     documents = {}
     insider_trades = {}
-    forms4 = {filing.accession: filing for filing in [*weekly_filings, *recent_filings] if filing.form == "4"}
+    forms4 = {filing.accession: filing for filing in [*weekly_filings, *recent_filings]
+              if filing.form in {"4", "4/A"}}
     with sec_budget(25):
         for filing in sorted(forms4.values(), key=lambda row: row.filing_date, reverse=True)[:FORM4_LIMIT]:
             try:
                 document = _form4_document(filing)
                 if document is not None:
-                    insider_trades.setdefault(filing.ticker, []).extend(_form4_transactions(document, filing))
+                    trades = insider_trades.setdefault(filing.ticker, [])
+                    for trade in _form4_transactions(document, filing):
+                        identity = ("owner", "side", "date", "shares", "price")
+                        duplicate = any(
+                            (trade["form"] == "4/A" or existing["form"] == "4/A")
+                            and all(trade[key] == existing[key] for key in identity)
+                            for existing in trades
+                        )
+                        if not duplicate:
+                            trades.append(trade)
             except (SecError, etree.XMLSyntaxError, ValueError) as exc:
                 logger.info("Form 4 %s: odczyt niedostępny (%s).", filing.accession, type(exc).__name__)
 
@@ -68,6 +86,11 @@ def collect_sec_monitoring(recent_filings, weekly_filings):
             excerpts = []
             for url, document in _filing_documents(filing, limit=2, exhibits_first=filing.form in {"6-K", "6-K/A"}):
                 text = _document_text(document)
+                if filing.form in {"8-K", "8-K/A"} and url.endswith(filing.primary_document):
+                    headings = list(ITEM_HEADING.finditer(text))
+                    substantive = next((heading for heading in headings if not heading.group().endswith("9.01")), None)
+                    if substantive:
+                        text = text[substantive.start():]
                 if text:
                     excerpts.append((url, text[:EXCERPT_LENGTH]))
             if excerpts:

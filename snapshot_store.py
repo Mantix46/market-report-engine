@@ -1,5 +1,6 @@
 import os
 import csv
+from csv_state import write_csv
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -17,7 +18,7 @@ def get_snapshot_file_path() -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "daily_snapshots.csv")
 
 
-def load_last_snapshots(before: Optional[str] = None) -> dict:
+def load_last_snapshots(before: Optional[str] = None, *, target_only: bool = False) -> dict:
     """Wczytuje ostatnie zapisane snapshoty dla każdego tickera sprzed podanej daty.
 
     before — data graniczna "YYYY-MM-DD" (wyłącznie); domyślnie dziś, czyli
@@ -37,12 +38,13 @@ def load_last_snapshots(before: Optional[str] = None) -> dict:
             for row in reader:
                 ticker = row.get("ticker")
                 date_val = row.get("date")
-                if not ticker or not date_val:
+                if not ticker or not date_val or (target_only and not row.get("target_mean")):
                     continue
                 if date_val < cutoff_str:
                     if ticker not in snapshots or date_val > snapshots[ticker]["date"]:
                         snapshots[ticker] = {
                             "date": date_val,
+                            "target_mean": float(row["target_mean"]) if row.get("target_mean") else None,
                             "price": float(row["price"]) if row.get("price") else None,
                             "change_pct": float(row["change_pct"]) if row.get("change_pct") else None,
                             "rsi_14": float(row["rsi_14"]) if row.get("rsi_14") else None,
@@ -63,7 +65,7 @@ def save_today_snapshots(current_metrics: dict):
     today_str = warsaw_now().strftime("%Y-%m-%d")
     
     fieldnames = ["date", "ticker", "price", "change_pct", "rsi_14",
-                  "price_vs_sma20", "price_vs_sma50", "macd_histogram", "bollinger_position"]
+                  "price_vs_sma20", "price_vs_sma50", "macd_histogram", "bollinger_position", "target_mean"]
 
     cutoff_str = (warsaw_now().date() - timedelta(days=SNAPSHOT_RETENTION_DAYS)).strftime("%Y-%m-%d")
 
@@ -82,11 +84,13 @@ def save_today_snapshots(current_metrics: dict):
                     existing_rows.append(row)
         except Exception as e:
             logger.warning(f"Błąd odczytu przy aktualizacji snapshotów: {e}")
+            return
             
     for ticker, metrics in current_metrics.items():
         existing_rows.append({
             "date": today_str,
             "ticker": ticker,
+            "target_mean": metrics.get("target_mean"),
             "price": metrics.get("price"),
             "change_pct": metrics.get("change_pct"),
             "rsi_14": metrics.get("rsi_14"),
@@ -97,12 +101,7 @@ def save_today_snapshots(current_metrics: dict):
         })
 
     try:
-        with open(snapshot_file, "w", newline="", encoding="utf-8") as f:
-            # extrasaction='ignore' — stare wiersze bez nowych kolumn są bezpieczne
-            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-            writer.writeheader()
-            for row in existing_rows:
-                writer.writerow(row)
+        write_csv(snapshot_file, fieldnames, existing_rows)
     except Exception as e:
         logger.error(f"Błąd zapisu snapshotów do {snapshot_file}: {e}")
 

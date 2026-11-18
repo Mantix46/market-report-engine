@@ -127,6 +127,8 @@ Listy spółek, zapytania newsowe i notatki znajdują się w prywatnym, ignorowa
 - `TICKER_NOTES` — własne uwagi o instrumentach,
 - `RADAR_SMALLCAPS` — lista spółek obserwowanych przez radar.
 
+W wydaniu dziennym radar pokazuje do czterech spółek spoza portfela. Pełna tabela wyceny pojawia się w sobotę. Porównanie celów cenowych wymaga wcześniejszego odczytu zapisanego w `daily_snapshots.csv`. Podgląd i ręczny test gałęzi korzystają z dostępnej historii bez zapisu do prywatnego repozytorium stanu.
+
 Zmiana list wpływa na zakres raportu, czas działania i liczbę zapytań do zewnętrznych źródeł.
 
 ## SEC, wyniki i sentyment

@@ -84,14 +84,6 @@ def _max_attempts(model_name: str) -> int:
     return GEMINI_MAX_ATTEMPTS_PER_MODEL.get(model_name, default)
 
 
-def _is_slow_error(err: BaseException) -> bool:
-    """Timeout albo 504: model liczył za długo, druga próba 3.5 ma sens."""
-    if isinstance(err, TimeoutError):
-        return True
-    text = str(err).lower()
-    return any(token in text for token in ("504", "deadline", "timeout", "timed out"))
-
-
 def _is_transient_error(err: BaseException) -> bool:
     """429 (nie dobowa quota), 500, 502, 503, 504 — warto ponowić ten sam model."""
     text = str(err).lower()

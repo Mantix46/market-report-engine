@@ -62,7 +62,7 @@ def load_config() -> dict:
     return config
 
 
-def generate_and_send(config: dict, send_email: bool = True):
+def generate_and_send(config: dict, send_email: bool = True) -> bool:
     """Generuje raport i opcjonalnie wysyła mailem."""
     
     now = warsaw_now()
@@ -74,7 +74,7 @@ def generate_and_send(config: dict, send_email: bool = True):
     # Sprawdzenie dnia: Nie wysyłamy w Niedzielę (6) i Poniedziałek (0)
     if now.weekday() in [0, 6]:
         logger.info("Dzień wolny od raportów (Niedziela / Poniedziałek). Pomijam generowanie.")
-        return
+        return True
 
     # Jeśli OBA rynki są dziś zamknięte z powodu święta — pomijamy raport
     status = market_status()
@@ -82,7 +82,7 @@ def generate_and_send(config: dict, send_email: bool = True):
         us_h = status["US"]["holiday"] or "święto"
         pl_h = status["PL"]["holiday"] or "święto"
         logger.info(f"Oba rynki zamknięte dziś (USA: {us_h}, GPW: {pl_h}). Pomijam generowanie.")
-        return
+        return True
 
     # 1. Generowanie raportu
     print("[1/2] Pobieram dane rynkowe...")
@@ -99,7 +99,7 @@ def generate_and_send(config: dict, send_email: bool = True):
                 f"Spróbuj uruchomić go ponownie później (Actions → Run workflow) "
                 f"lub sprawdź status Yahoo Finance.\n"
             )
-            send_report_email(
+            return send_report_email(
                 smtp_server=config["smtp_server"],
                 smtp_port=config["smtp_port"],
                 smtp_user=config["smtp_user"],
@@ -108,7 +108,7 @@ def generate_and_send(config: dict, send_email: bool = True):
                 md_report=warning_md,
                 subject=f"⚠ Raport Rynkowy — problem z danymi ({now.strftime('%d.%m.%Y')})",
             )
-        return
+        return False
     logger.info(f"Raport wygenerowany ({len(report)} znaków)")
     
     # Zapisz kopię archiwalną lokalnie
@@ -134,13 +134,16 @@ def generate_and_send(config: dict, send_email: bool = True):
             md_report=report,
         )
         if success:
-            sec_scan.acknowledge()
+            if sec_scan.acknowledge() is False and sec_scan.filings:
+                logger.warning("SMTP przyjął raport. Zgłoszenia SEC mogą pojawić się ponownie.")
         else:
-            logger.warning("Wysyłka maila nie powiodła się.")
+            logger.error("Wysyłka maila nie powiodła się.")
+            return False
     else:
         print("[2/2] Pominięto wysyłkę e-mail (--no-email)")
     
     print(f"\n{'='*60}\n")
+    return True
 
 
 def run_scheduler(config: dict):
@@ -206,16 +209,17 @@ def main():
             report = build_report(persist_state=False)
         except DataQualityError as e:
             logger.error(f"Wstrzymano raport — problem z jakością danych: {e}")
-            return
+            raise SystemExit(1) from e
         print(report)
         return
     
-    config = load_config()
+    config = {} if args.no_email else load_config()
     
     if args.schedule:
         run_scheduler(config)
     else:
-        generate_and_send(config, send_email=not args.no_email)
+        if not generate_and_send(config, send_email=not args.no_email):
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import csv
+from csv_state import write_csv
 import os
 import re
 from datetime import datetime, timedelta
@@ -282,11 +283,7 @@ def save_predictions(predictions: list[dict]) -> None:
                 existing_rows.append(row)
 
     existing_rows.extend(predictions)
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in existing_rows:
-            writer.writerow({key: row.get(key, "") for key in fieldnames})
+    write_csv(path, fieldnames, existing_rows)
 
 
 def _horizon_close(hist, pred_date, horizon_days: int) -> Optional[float]:
@@ -425,11 +422,7 @@ def evaluate_previous_predictions(dry_run: bool = False) -> dict:
     # Zapis pliku (nowe kolumny + retencja + czystka) — pomijany w dry_run (--preview)
     if not dry_run:
         try:
-            with open(path, "w", encoding="utf-8", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=PREDICTION_FIELDNAMES, extrasaction="ignore")
-                writer.writeheader()
-                for row in rows:
-                    writer.writerow({key: row.get(key, "") for key in PREDICTION_FIELDNAMES})
+            write_csv(path, PREDICTION_FIELDNAMES, rows)
         except Exception as e:
             logger.error(f"Blad zapisu prediction_tracker.csv: {e}")
 
@@ -439,6 +432,14 @@ def evaluate_previous_predictions(dry_run: bool = False) -> dict:
     evaluated_rows = [r for r in rows if r.get("evaluated_date")]
     total_hits = sum(1 for r in evaluated_rows if str(r.get("hit")) in ("1", "True", "true"))
     stats = _calculate_accuracy_stats(evaluated_rows)
+    sources = ("gemini_report", "rule_based_pre_gemini")
+    comparison = {}
+    for row in evaluated_rows:
+        if row.get("source") in sources:
+            key = (row.get("date"), row.get("ticker"))
+            comparison.setdefault(key, {})[row["source"]] = row
+    pairs = [pair for pair in comparison.values() if all(source in pair for source in sources)]
+    matched = [row for pair in pairs for row in pair.values()]
     if changed and not dry_run:
         logger.info(f"Rozliczono {len(new_evaluations)} prognoz (lacznie: {total_hits}/{len(evaluated_rows)}).")
     return {
@@ -447,6 +448,7 @@ def evaluate_previous_predictions(dry_run: bool = False) -> dict:
         "total_evaluated": len(evaluated_rows),
         "pending": pending,
         "stats": stats,
+        "matched_sources": _calculate_accuracy_stats(matched)["source"],
     }
 
 
@@ -549,11 +551,7 @@ def record_prediction_reviews(reviews: list[dict]) -> int:
     if not changed:
         return 0
     try:
-        with open(path, "w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=PREDICTION_FIELDNAMES, extrasaction="ignore")
-            writer.writeheader()
-            for row in rows:
-                writer.writerow({key: row.get(key, "") for key in PREDICTION_FIELDNAMES})
+        write_csv(path, PREDICTION_FIELDNAMES, rows)
     except Exception as exc:
         logger.error(f"Błąd zapisu review prognoz: {exc}")
         return 0
@@ -610,12 +608,14 @@ def format_accuracy_section(result: dict) -> str:
         pct = total_hits / total_evaluated * 100
         lines.append(f"Skutecznosc lacznie (prognozy sobotnie): **{total_hits}/{total_evaluated}** ({pct:.0f}%).")
         lines.append("")
-        stats = result.get("stats") or {}
-        if stats.get("source"):
+        matched = result.get("matched_sources") or {}
+        if matched:
             lines.append("**Porównanie źródeł:**")
-            for source, item in sorted(stats["source"].items()):
+            for source, item in sorted(matched.items()):
                 source_pct = item["hits"] / item["total"] * 100 if item["total"] else 0
                 sample_note = " — mała próba" if item["total"] < 20 else ""
                 lines.append(f"- {source}: {item['hits']}/{item['total']} ({source_pct:.0f}%){sample_note}")
             lines.append("")
+        else:
+            lines.append("Brak wspólnych rozliczonych prognoz Gemini i modelu regułowego.")
     return "\n".join(lines)

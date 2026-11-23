@@ -12,8 +12,8 @@ from data_fetching import (
     TICKER_NAMES, MACRO_TICKERS, GPW_NEWS_QUERIES,
     US_BENCHMARK, PL_BENCHMARK,
     fetch_nasdaq100_tickers, fetch_quote_cached, fetch_quotes_batch, get_top_movers,
-    fetch_fundamentals_short_insider, fetch_earnings_dates,
-    fetch_macro_calendar, fetch_earnings_call_context
+    fetch_fundamentals_short_insider, fetch_earnings_dates, fetch_analyst_recommendations,
+    fetch_macro_calendar, fetch_earnings_call_context, GLOBAL_CACHE
 )
 
 from news_fetcher import fetch_all_news
@@ -25,6 +25,7 @@ from snapshot_store import load_last_snapshots, save_today_snapshots
 from market_calendar import market_status, warsaw_now
 from sec_edgar import SecScan, configured_sec_tickers, poll_sec
 from earnings_report import collect_earnings
+from sec_monitoring import collect_sec_monitoring
 from guidance_consensus import load_guidance_estimates, refresh_guidance_estimates
 from market_sentiment import collect_market_sentiment
 
@@ -165,16 +166,20 @@ def format_insider_lines(ticker: str, fund: dict) -> list[str]:
     sell_val = ins.get("sell_value_90d") or 0
     buy_txt = (
         f"brak zakupów"
-        if not buy_val else
+        if not ins.get("recent_buys_90d") else
         f"kupno {format_money_amount(buy_val, ccy)}"
         f" ({ins.get('recent_buys_90d', 0)} trans.){_plan_split_text('buy', ins, ccy)}"
     )
     sell_txt = (
         f"brak sprzedaży"
-        if not sell_val else
+        if not ins.get("recent_sales_90d") else
         f"sprzedaż {format_money_amount(sell_val, ccy)}"
         f" ({ins.get('recent_sales_90d', 0)} trans.){_plan_split_text('sell', ins, ccy)}"
     )
+    if ins.get("unknown_value_90d"):
+        buy_txt = f"kupno: {ins.get('recent_buys_90d', 0)} trans., {ins.get('buy_shares_90d', 0):,} akcji"
+        sell_txt = f"sprzedaż: {ins.get('recent_sales_90d', 0)} trans., {ins.get('sell_shares_90d', 0):,} akcji"
+        sell_txt += " (niepełne dane o kwotach)"
     lines = [
         f"      insiderzy 90d: {buy_txt}; {sell_txt}; "
         f"sygnał: {_v(fund.get('insider_signal'))}; źródło: {source}"
@@ -246,6 +251,7 @@ def collect_report_data(persist_state: bool = True) -> dict:
 
     # 1. Notowania: portfel (techniczne, fundamenty, alpha), indeksy, makro
     logger.info("Pobieram dane rynkowe (portfel, indeksy, makro)...")
+    GLOBAL_CACHE.clear()
     portfolio_details = collect_portfolio_data()
     index_quotes = {name: fetch_quote_cached(ticker, period="5d") for name, ticker in INDEX_TICKERS.items()}
     macro_quotes = {name: fetch_quote_cached(ticker, period="5d") for name, ticker in MACRO_TICKERS.items()}
@@ -264,12 +270,17 @@ def collect_report_data(persist_state: bool = True) -> dict:
                 f"(próg: {MIN_DATA_QUALITY:.0%}). Prawdopodobna awaria źródła danych (yfinance)."
             )
 
+    analyst_recs = {ticker: fetch_analyst_recommendations(ticker) for ticker in active_tickers}
+
     # 3. Top movers (tylko otwarte rynki)
     logger.info("Obliczam top movers (NASDAQ-100 i GPW-100)...")
-    radar_us = fetch_nasdaq100_tickers() if us_active else []
+    portfolio = set(US_TICKERS) | set(GPW_TICKERS_MAP)
+    radar_us = [ticker for ticker in fetch_nasdaq100_tickers() if ticker not in portfolio] if us_active else []
+    radar_pl = [ticker for ticker in GPW_100_TICKERS if ticker not in portfolio]
+    radar_smallcaps = [ticker for ticker in RADAR_SMALLCAPS if ticker not in portfolio]
     us_winners, us_losers = get_top_movers(radar_us, top_n=3, period="5d") if us_active else ([], [])
-    gpw_winners, gpw_losers = get_top_movers(GPW_100_TICKERS, top_n=3, period="5d") if pl_active else ([], [])
-    sc_winners, sc_losers = get_top_movers(RADAR_SMALLCAPS, top_n=5, period="5d") if us_active else ([], [])
+    gpw_winners, gpw_losers = get_top_movers(radar_pl, top_n=3, period="5d") if pl_active else ([], [])
+    sc_winners, sc_losers = get_top_movers(radar_smallcaps, top_n=5, period="5d") if us_active else ([], [])
     today_movers = {
         "us_winners": us_winners,
         "us_losers": us_losers,
@@ -282,7 +293,7 @@ def collect_report_data(persist_state: bool = True) -> dict:
     # 4. Kalendarz wyników i kontekst earnings call — JEDNO pobranie na cały raport
     logger.info("Pobieram kalendarz publikacji wyników...")
     earnings_dates = fetch_earnings_dates(active_tickers)
-    earnings_call_context = fetch_earnings_call_context(active_tickers)
+    earnings_call_context = fetch_earnings_call_context(active_tickers) if is_saturday else {}
 
     # 5. Newsy (superset: portfel + indeksy + makro + top movers)
     logger.info("Pobieranie newsów (Google News RSS + Yahoo Finance)...")
@@ -307,11 +318,13 @@ def collect_report_data(persist_state: bool = True) -> dict:
     if is_saturday:
         snapshot_before = (now.date() - timedelta(days=5)).strftime("%Y-%m-%d")
     last_snapshots = load_last_snapshots(before=snapshot_before)
+    last_target_snapshots = load_last_snapshots(target_only=True)
     current_metrics = {}
     for t, data in portfolio_details.items():
         quote = data.get("quote") or {}
         technicals = data.get("technicals") or {}
         current_metrics[t] = {
+            "target_mean": ((analyst_recs.get(t) or {}).get("price_targets") or {}).get("mean"),
             "price": quote.get("price"),
             "change_pct": quote.get("change_pct"),
             "rsi_14": technicals.get("rsi_14"),
@@ -357,38 +370,14 @@ def collect_report_data(persist_state: bool = True) -> dict:
         "macro_calendar": macro_calendar,
         "today_movers": today_movers,
         "earnings_dates": earnings_dates,
+        "analyst_recs": analyst_recs,
         "earnings_call_context": earnings_call_context,
         "news_data": news_data,
         "last_snapshots": last_snapshots,
+        "last_target_snapshots": last_target_snapshots,
         "current_prices": current_prices,
     }
 
-
-def _report_header(now: datetime, skip: set, status: dict) -> str:
-    """Nagłówek raportu + baner o zamkniętych rynkach (wspólny dla obu rendererów)."""
-    date_str = now.strftime("%d.%m.%Y")
-    day_names = {
-        0: "poniedziałek", 1: "wtorek", 2: "środa",
-        3: "czwartek", 4: "piątek", 5: "sobota", 6: "niedziela"
-    }
-    day_name = day_names[now.weekday()]
-    header = (
-        f"# RAPORT RYNKOWY -- {date_str} ({day_name})\n"
-        f"*Senior Capital Markets Analyst | Sektor: Tech/Semiconductors (NASDAQ) + GPW*\n\n---\n\n"
-    )
-    banner = market_banner_lines(skip, status)
-    if banner:
-        header += "\n".join(banner) + "\n\n"
-    return header
-
-
-# ============================================================
-# FAZA 2a: Renderer podstawowy (bez AI)
-# ============================================================
-
-# ============================================================
-# FAZA 2b: Renderer AI (Gemini)
-# ============================================================
 
 def _v(x, suffix: str = "") -> str:
     """Wartość do prompta: None -> 'b/d', inaczej wartość + sufiks."""
@@ -404,7 +393,7 @@ def _fmt_quote_line(label: str, q: dict) -> str:
     vol_txt = f", wolumen {vol:,}" if vol else ""
     stale = " [STALE]" if q.get("is_stale") else ""
     return (
-        f"{label}: {q['price']:,.2f} ({q.get('change_pct', 0):+.2f}%)"
+        f"{label}: {q['price']:,.2f} ({format_pct(q.get('change_pct'))})"
         f"{vol_txt}, sesja {q.get('data_date', 'b/d')}{stale}"
     )
 
@@ -421,31 +410,20 @@ def _fmt_movers(movers: list) -> str:
     return "\n".join(lines) if lines else "    - brak"
 
 
-def _fmt_earnings(earnings_dates: dict) -> str:
-    lines = [
-        f"    - {t}: {info.get('date', 'b/d')} (za {info.get('days_until', '?')} dni)"
-        for t, info in earnings_dates.items()
-    ]
-    return "\n".join(lines) if lines else "    - brak danych o nadchodzących wynikach"
-
-
 def _fmt_portfolio_block(portfolio_details: dict) -> str:
     """Zwięzły, czytelny opis portfela do prompta (zamiast repr() zagnieżdżonych słowników)."""
     out = []
     for t, d in portfolio_details.items():
         d = d or {}
-        q = d.get("quote") or {}
         tech = d.get("technicals") or {}
         fund = d.get("fundamentals") or {}
 
         out.append(f"    {TICKER_NAMES.get(t, t)} ({t}):")
-        out.append(f"      notowanie: {_fmt_quote_line(t, q)}")
         out.append(
             f"      technika: RSI {_v(tech.get('rsi_14'))}, vs SMA20 {_v(tech.get('price_vs_sma20'), '%')}, "
             f"vs SMA50 {_v(tech.get('price_vs_sma50'), '%')}, MACD hist {_v(tech.get('macd_histogram'))} "
             f"({_v(tech.get('macd_trend'))}), Bollinger {_v(tech.get('bollinger_position'))} "
-            f"({_v(tech.get('bollinger_signal'))}), zmiana 5 sesji {_v(tech.get('change_5d'), '%')}, "
-            f"wolumen {_v(tech.get('volume_ratio_10d'), 'x śr. 10d')}"
+            f"({_v(tech.get('bollinger_signal'))})"
         )
         out.append(
             f"      trend: układ średnich {_v(tech.get('ema_stack'))}, ADX {_v(tech.get('adx'))} "
@@ -466,7 +444,6 @@ def _fmt_portfolio_block(portfolio_details: dict) -> str:
             f"kapitalizacja {mcap_txt}, {_v(fund.get('pct_from_52w_high'), '%')} od szczytu 52w, "
             f"{_v(fund.get('pct_from_52w_low'), '%')} od dołka 52w, short float {_v(short_pct, '%')}"
         )
-        out.extend(format_insider_lines(t, fund))
         bench = US_BENCHMARK if not t.endswith(".WA") else PL_BENCHMARK
         out.append(f"      alpha 1M vs benchmark sektorowy ({bench}): {_v(d.get('alpha_1m_vs_benchmark'), ' pp')}")
         out.append("")
@@ -500,6 +477,10 @@ def _collect_enrichments(data: dict, sec_scan: Optional[SecScan], persist_state:
     })
     active_tickers = set(data.get("active_tickers") or [])
     data["monitoring_filings"] = [filing for filing in recent.values() if filing.ticker in active_tickers]
+    data["sec_documents"], data["sec_insider_trades"] = collect_sec_monitoring(
+        data["monitoring_filings"],
+        [filing for filing in scan.weekly_filings if filing.ticker in active_tickers],
+    )
     is_saturday = data.get("is_saturday", False)
     filings = scan.weekly_filings if is_saturday else data["monitoring_filings"]
     estimates = load_guidance_estimates() if is_saturday or filings or persist_state else []
@@ -524,7 +505,7 @@ def build_report(persist_state: bool = True, *, sec_scan: Optional[SecScan] = No
     z TYCH SAMYCH danych (bez ponownego pobierania).
 
     persist_state=False (--preview): bez zapisu snapshotów i prognoz.
-    Stary układ v1 zarchiwizowany w archive/layout_v1.py (nieużywany)."""
+    """
     api_key = os.getenv("GEMINI_API_KEY")
     has_ai = bool(
         api_key and genai

@@ -674,7 +674,7 @@ def _topic_summary(topic: str, filings: list[Filing], *, link: bool) -> str:
     return f"- **{_markdown(topic)}** · " + " · ".join(details)
 
 
-def render_sec(scan: SecScan, *, earnings_accessions: set[str] | None = None) -> str:
+def render_sec(scan: SecScan, *, earnings_accessions: set[str] | None = None, compact: bool = False) -> str:
     """Summarize the last seven SEC filing dates by company and topic."""
     lines = ["## SEC EDGAR", ""]
     weekly = {filing.accession: filing for filing in scan.weekly_filings}
@@ -683,10 +683,11 @@ def render_sec(scan: SecScan, *, earnings_accessions: set[str] | None = None) ->
         companies.setdefault(filing.ticker, []).append(filing)
     if companies:
         lines.append("Ostatnie 7 dni według dat zgłoszeń w SEC.")
+        if compact:
+            lines.append("")
     elif not scan.warnings:
         lines.append("Brak zgłoszeń z ostatnich 7 dni.")
     for ticker, filings in sorted(companies.items()):
-        lines.extend(["", f"### {_markdown(ticker)} · {_filing_count(len(filings))}", ""])
         grouped = {}
         for filing in filings:
             topics = (
@@ -696,6 +697,12 @@ def render_sec(scan: SecScan, *, earnings_accessions: set[str] | None = None) ->
             )
             for topic in topics:
                 grouped.setdefault(topic, []).append(filing)
+        if compact:
+            topic, group = max(grouped.items(), key=lambda item: len(item[1]))
+            lines.append(f"- **{_markdown(ticker)}** · {_filing_count(len(filings))} · "
+                         f"{_markdown(topic)} · {_representative_link(group[0])}")
+            continue
+        lines.extend(["", f"### {_markdown(ticker)} · {_filing_count(len(filings))}", ""])
         linked = set()
         for topic, group in grouped.items():
             accession = group[0].accession

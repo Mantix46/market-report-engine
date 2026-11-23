@@ -232,6 +232,7 @@ def fetch_technicals(ticker: str) -> dict:
         # 2 lata historii — potrzebne dla SMA200 / EMA200 i wygrzania wskaźników trendu
         raw_history = t.history(period="2y")
         if len(raw_history) < 14:
+            logger.warning("Technika %s: Yahoo Finance zwróciło tylko %d sesji.", ticker, len(raw_history))
             return _empty_technicals()
         original_close = raw_history["Close"].iloc[-55:].copy()
         hist = clean_history(ticker, raw_history, t)
@@ -260,10 +261,7 @@ def fetch_technicals(ticker: str) -> dict:
             if price_5d_ago and not pd.isna(price_5d_ago):
                 change_5d = round(((price - price_5d_ago) / price_5d_ago) * 100, 2)
 
-        try:
-            avg_vol = t.fast_info["tenDayAverageVolume"]
-        except Exception:
-            avg_vol = hist["Volume"].rolling(10).mean().iloc[-1]
+        avg_vol = hist["Volume"].rolling(10).mean().iloc[-1]
         last_vol = hist["Volume"].iloc[-1]
         vol_ratio = last_vol / avg_vol if avg_vol and avg_vol > 0 else None
 

@@ -34,7 +34,7 @@ def test_pending_sec_filings_acknowledged_only_after_successful_smtp(monkeypatch
     config = dict(smtp_server="example.com", smtp_port=587, smtp_user="user",
                   smtp_password="test", recipient="recipient@example.com")
 
-    main.generate_and_send(config)
+    assert main.generate_and_send(config) is success
 
     scan_watchlist.assert_called_once_with(persist=True)
     assert build.call_args.kwargs["sec_scan"] is scan

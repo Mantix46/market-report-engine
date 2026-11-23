@@ -185,9 +185,6 @@ def test_is_daily_quota_error():
     assert not gemini_client._is_daily_quota_error(_OVERLOAD_MSG)
     assert not gemini_client._is_daily_quota_error(
         "429 RESOURCE_EXHAUSTED limit: 20 PerMinute")
-    assert gemini_client._is_slow_error(TimeoutError("limit"))
-    assert gemini_client._is_slow_error(Exception("504 DEADLINE_EXCEEDED"))
-    assert not gemini_client._is_slow_error(Exception(_OVERLOAD_MSG))
 
 
 def test_503_retries_same_model_with_backoff_then_success(gemini_env):

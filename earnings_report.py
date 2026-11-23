@@ -238,16 +238,17 @@ def _read_html(url):
         return None
 
 
-def _filing_documents(filing):
+def _filing_documents(filing, *, limit=None, exhibits_first=False):
     """Return the primary filing plus SEC-linked exhibit 99 HTML documents."""
     archive = (f"https://www.sec.gov/Archives/edgar/data/{int(filing.cik)}/"
                f"{filing.accession.replace('-', '')}/")
     index = _read_html(f"{archive}{filing.accession}-index.htm")
     docs = []
+    primary = []
     if filing.primary_document:
         url = urljoin(archive, filing.primary_document)
         if url.startswith(archive):
-            docs.append(url)
+            primary.append(url)
     if index is not None:
         for row in index.xpath("//table//tr"):
             cells = row.xpath("./td")
@@ -257,7 +258,8 @@ def _filing_documents(filing):
                 url = urljoin(archive, href)
                 if url.startswith(archive) and urlsplit(url).path.lower().endswith((".htm", ".html")):
                     docs.append(url)
-    for url in list(dict.fromkeys(docs)):
+    urls = docs + primary if exhibits_first else primary + docs
+    for url in list(dict.fromkeys(urls))[:limit]:
         document = _read_html(url)
         if document is not None:
             yield url, document
